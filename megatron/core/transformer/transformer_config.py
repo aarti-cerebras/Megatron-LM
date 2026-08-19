@@ -42,6 +42,10 @@ from ..utils import (
 
 logger = logging.getLogger(__name__)
 
+_DSA_SERVING_FP8_BLOCK_SIZE = 128
+_DSA_SERVING_HEAD_TILE_SIZE = 128
+_DSA_SERVING_INDEXER_HEAD_DIMS = (32, 64, 128)
+
 try:
     from packaging.version import Version as PkgVersion
 
@@ -360,8 +364,9 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_fp8_ue8m0: bool = True
     """Whether DSA indexer FP8 fake quantization uses power-of-two UE8M0 scales."""
 
-    dsa_indexer_fp8_block_size: int = 128
-    """Serving FP8 quantization block size. DSA-GQA currently uses one scale per indexer row."""
+    dsa_indexer_fp8_block_size: int = _DSA_SERVING_FP8_BLOCK_SIZE
+    """Serving FP8 quantization block size used for compatibility validation.
+    Fake quantization always uses one scale per indexer row and does not consume this value."""
 
     dsa_indexer_serving_compat: bool = False
     """Whether to reject DSA indexer configurations that cannot use the serving FP8 kernel."""
@@ -1480,47 +1485,46 @@ class TransformerConfig(ModelParallelConfig):
                     f"{self.dsa_indexer_skip_topk_offset}."
                 )
 
+            if self.dsa_indexer_fp8_block_size < 1:
+                raise ValueError("dsa_indexer_fp8_block_size must be positive.")
+            if self.dsa_indexer_fp8 and self.dsa_indexer_head_dim is not None:
+                if self.dsa_indexer_head_dim > self.dsa_indexer_fp8_block_size:
+                    raise ValueError(
+                        "DSA FP8 currently requires one scale per indexer row, but "
+                        f"head_dim={self.dsa_indexer_head_dim} exceeds "
+                        f"block_size={self.dsa_indexer_fp8_block_size}."
+                    )
+            if self.dsa_indexer_serving_compat:
+                if not self.dsa_indexer_fp8:
+                    raise ValueError("dsa_indexer_serving_compat requires dsa_indexer_fp8=True.")
+                if not self.dsa_indexer_fp8_ue8m0:
+                    raise ValueError("dsa_indexer_serving_compat requires UE8M0 indexer scales.")
+                if not self.dsa_indexer_rotate_activation:
+                    raise ValueError(
+                        "dsa_indexer_serving_compat requires Hadamard rotate_activation."
+                    )
+                if self.dsa_indexer_fp8_block_size != _DSA_SERVING_FP8_BLOCK_SIZE:
+                    raise ValueError(
+                        "dsa_indexer_serving_compat requires "
+                        f"dsa_indexer_fp8_block_size={_DSA_SERVING_FP8_BLOCK_SIZE}."
+                    )
+                if self.dsa_indexer_head_dim not in _DSA_SERVING_INDEXER_HEAD_DIMS:
+                    raise ValueError(
+                        "dsa_indexer_serving_compat requires dsa_indexer_head_dim in "
+                        f"{_DSA_SERVING_INDEXER_HEAD_DIMS}, got {self.dsa_indexer_head_dim}."
+                    )
+                if (
+                    self.dsa_indexer_n_heads is None
+                    or self.dsa_indexer_n_heads < 1
+                    or _DSA_SERVING_HEAD_TILE_SIZE % self.dsa_indexer_n_heads != 0
+                ):
+                    raise ValueError(
+                        "dsa_indexer_serving_compat requires dsa_indexer_n_heads to divide "
+                        f"the serving kernel head tile size {_DSA_SERVING_HEAD_TILE_SIZE}, got "
+                        f"{self.dsa_indexer_n_heads}."
+                    )
+
             if self.experimental_attention_variant == "dsa_gqa":
-                if self.dsa_indexer_fp8_block_size < 1:
-                    raise ValueError("dsa_indexer_fp8_block_size must be positive.")
-                if self.dsa_indexer_fp8 and self.dsa_indexer_head_dim is not None:
-                    if self.dsa_indexer_head_dim > self.dsa_indexer_fp8_block_size:
-                        raise ValueError(
-                            "dsa_gqa FP8 currently requires one scale per indexer row, but "
-                            f"head_dim={self.dsa_indexer_head_dim} exceeds "
-                            f"block_size={self.dsa_indexer_fp8_block_size}."
-                        )
-                if self.dsa_indexer_serving_compat:
-                    if not self.dsa_indexer_fp8:
-                        raise ValueError(
-                            "dsa_indexer_serving_compat requires dsa_indexer_fp8=True."
-                        )
-                    if not self.dsa_indexer_fp8_ue8m0:
-                        raise ValueError(
-                            "dsa_indexer_serving_compat requires UE8M0 indexer scales."
-                        )
-                    if not self.dsa_indexer_rotate_activation:
-                        raise ValueError(
-                            "dsa_indexer_serving_compat requires Hadamard rotate_activation."
-                        )
-                    if self.dsa_indexer_fp8_block_size != 128:
-                        raise ValueError(
-                            "dsa_indexer_serving_compat requires dsa_indexer_fp8_block_size=128."
-                        )
-                    if self.dsa_indexer_head_dim not in (32, 64, 128):
-                        raise ValueError(
-                            "dsa_indexer_serving_compat requires dsa_indexer_head_dim in "
-                            f"(32, 64, 128), got {self.dsa_indexer_head_dim}."
-                        )
-                    if (
-                        self.dsa_indexer_n_heads is None
-                        or self.dsa_indexer_n_heads < 1
-                        or 128 % self.dsa_indexer_n_heads != 0
-                    ):
-                        raise ValueError(
-                            "dsa_indexer_serving_compat requires dsa_indexer_n_heads to divide "
-                            f"128, got {self.dsa_indexer_n_heads}."
-                        )
                 if self.dsa_indexer_rope_type not in (None, "rope", "yarn"):
                     raise ValueError(
                         "dsa_gqa supports dsa_indexer_rope_type='rope' or 'yarn', got "
@@ -1545,9 +1549,7 @@ class TransformerConfig(ModelParallelConfig):
                         "dsa_gqa learnable softmax requires Transformer Engine >= 2.8.0."
                     )
                 if self.dsa_dense_warmup and self.dsa_indexer_use_sparse_loss:
-                    raise ValueError(
-                        "dsa_dense_warmup requires dsa_indexer_use_sparse_loss=False."
-                    )
+                    raise ValueError("dsa_dense_warmup requires dsa_indexer_use_sparse_loss=False.")
                 if self.dsa_dense_warmup and not self.dsa_freeze_base:
                     raise ValueError("dsa_dense_warmup requires dsa_freeze_base=True.")
                 if self.dsa_freeze_base and not self.dsa_dense_warmup:

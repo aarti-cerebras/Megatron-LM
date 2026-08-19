@@ -70,11 +70,14 @@ def test_grouped_teacher_scores_match_explicit_gqa_reference():
 
     actual = _compute_grouped_attention_scores(query, key, 0.5)
     expanded_key = key.repeat_interleave(4, dim=2)
-    expected = torch.einsum(
-        "bhsd,bhdk->bhsk",
-        query.permute(1, 2, 0, 3).float(),
-        expanded_key.permute(1, 2, 3, 0).float(),
-    ) * 0.5
+    expected = (
+        torch.einsum(
+            "bhsd,bhdk->bhsk",
+            query.permute(1, 2, 0, 3).float(),
+            expanded_key.permute(1, 2, 3, 0).float(),
+        )
+        * 0.5
+    )
 
     torch.testing.assert_close(actual, expected)
 
@@ -109,22 +112,31 @@ def test_dsa_gqa_rejects_nonpositive_loss_block_size():
         _dsa_gqa_config(dsa_indexer_loss_block_size=0)
 
 
-def test_fp8_fake_quant_matches_ue8m0_reference_and_preserves_gradient():
+def test_fp8_fake_quant_matches_fixed_ue8m0_values_and_preserves_gradient():
     values = torch.tensor(
-        [[-3.25, -0.125, 0.0, 1.75], [0.015625, 0.25, 2.0, 5.0]], requires_grad=True
+        [[-3.25, -0.13, 0.1, 1.3, -2.7], [5.0, 0.1, 0.3, 1.1, -4.1]], requires_grad=True
+    )
+    expected = torch.tensor(
+        [[-3.25, -0.125, 0.1015625, 1.25, -2.75], [5.0, 0.1015625, 0.3125, 1.125, -4.0]]
     )
 
     actual = _fake_quant_fp8(values, use_ue8m0=True)
 
-    fp8_max = float(torch.finfo(torch.float8_e4m3fn).max)
-    amax = values.detach().abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
-    scale = torch.pow(2.0, torch.ceil(torch.log2(amax / fp8_max)))
-    expected = (values.detach() / scale).clamp(-fp8_max, fp8_max).to(
-        torch.float8_e4m3fn
-    ).float() * scale
-
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     actual.sum().backward()
+    torch.testing.assert_close(values.grad, torch.ones_like(values))
+
+
+def test_fp8_fake_quant_preserves_bf16_dtype_and_gradient():
+    values = torch.tensor(
+        [[-3.25, -0.13, 0.1, 1.3], [5.0, 0.1, 0.3, 1.1]], dtype=torch.bfloat16, requires_grad=True
+    )
+
+    actual = _fake_quant_fp8(values)
+
+    assert actual.dtype == torch.bfloat16
+    actual.sum().backward()
+    assert values.grad.dtype == torch.bfloat16
     torch.testing.assert_close(values.grad, torch.ones_like(values))
 
 
@@ -141,21 +153,28 @@ def test_fp8_fake_quant_tracks_full_precision_index_scores():
     assert relative_error.item() < 0.05
 
 
-def test_fp8_serving_padding_preserves_index_scores():
+def test_fp8_rowwise_quantization_preserves_serving_padding_scores():
     torch.manual_seed(123)
     q = torch.randn(12, 1, 4, 64)
     k = torch.randn(12, 1, 64)
     weights = torch.randn(12, 1, 4)
 
-    training_scores = _compute_index_scores(_fake_quant_fp8(q), weights, _fake_quant_fp8(k))
+    quantized_q = _fake_quant_fp8(q)
+    quantized_k = _fake_quant_fp8(k)
+    training_scores = _compute_index_scores(quantized_q, weights, quantized_k)
 
     padded_q = torch.nn.functional.pad(q, (0, 64, 0, 28))
     padded_k = torch.nn.functional.pad(k, (0, 64))
     padded_weights = torch.nn.functional.pad(weights, (0, 28))
-    serving_scores = _compute_index_scores(
-        _fake_quant_fp8(padded_q), padded_weights, _fake_quant_fp8(padded_k)
-    )
+    padded_quantized_q = _fake_quant_fp8(padded_q)
+    padded_quantized_k = _fake_quant_fp8(padded_k)
+    serving_scores = _compute_index_scores(padded_quantized_q, padded_weights, padded_quantized_k)
 
+    torch.testing.assert_close(padded_quantized_q[:, :, :4, :64], quantized_q)
+    torch.testing.assert_close(padded_quantized_k[..., :64], quantized_k)
+    assert torch.count_nonzero(padded_quantized_q[:, :, 4:]).item() == 0
+    assert torch.count_nonzero(padded_quantized_q[..., 64:]).item() == 0
+    assert torch.count_nonzero(padded_quantized_k[..., 64:]).item() == 0
     torch.testing.assert_close(training_scores, serving_scores, rtol=1e-5, atol=1e-5)
 
 
@@ -171,6 +190,18 @@ def test_fp8_serving_padding_preserves_index_scores():
         ({"dsa_indexer_n_heads": 12}, "n_heads to divide"),
     ],
 )
-def test_dsa_gqa_serving_compat_rejects_mismatched_indexer_numerics(overrides, message):
+@pytest.mark.parametrize("variant", ["dsa", "dsa_gqa"])
+def test_all_dsa_variants_reject_mismatched_serving_numerics(variant, overrides, message):
     with pytest.raises(ValueError, match=message):
-        _dsa_gqa_config(**overrides)
+        _dsa_gqa_config(experimental_attention_variant=variant, add_bias_linear=False, **overrides)
+
+
+@pytest.mark.parametrize("variant", ["dsa", "dsa_gqa"])
+def test_all_dsa_variants_validate_fp8_row_layout(variant):
+    with pytest.raises(ValueError, match="one scale per indexer row"):
+        _dsa_gqa_config(
+            experimental_attention_variant=variant,
+            add_bias_linear=False,
+            dsa_indexer_serving_compat=False,
+            dsa_indexer_fp8_block_size=32,
+        )

@@ -294,10 +294,8 @@ def _fake_quant_fp8(x: torch.Tensor, use_ue8m0: bool = True) -> torch.Tensor:
         scale = amax / _FP8_MAX
         if use_ue8m0:
             scale = torch.pow(2.0, torch.ceil(torch.log2(scale)))
-            normalized = (x.detach() / scale).clamp(-_FP8_MAX, _FP8_MAX)
-        else:
-            normalized = x.detach() / scale
-        quantized = normalized.to(_FP8_DTYPE).float() * scale
+        normalized = (x.detach() / scale).clamp(-_FP8_MAX, _FP8_MAX)
+        quantized = (normalized.to(_FP8_DTYPE).float() * scale).to(dtype=x.dtype)
     return x + (quantized - x).detach()
 
 
@@ -433,13 +431,9 @@ def _compute_grouped_attention_scores(
         )
 
     groups_per_kv = num_query_heads // num_kv_heads
-    query_grouped = query.permute(1, 2, 0, 3).reshape(
-        b, num_kv_heads, groups_per_kv, sq, head_dim
-    )
+    query_grouped = query.permute(1, 2, 0, 3).reshape(b, num_kv_heads, groups_per_kv, sq, head_dim)
     key_grouped = key.permute(1, 2, 3, 0)
-    scores = torch.einsum(
-        "bngqd,bndk->bngqk", query_grouped.float(), key_grouped.float()
-    )
+    scores = torch.einsum("bngqd,bndk->bngqk", query_grouped.float(), key_grouped.float())
     return scores.reshape(b, num_query_heads, sq, sk) * softmax_scale
 
 
@@ -933,9 +927,7 @@ def _indexer_loss_block_mask(
     """Return validity and additive bias for one query/key loss block."""
     if varlen_starts is not None:
         valid = dsa_masking.build_valid_mask_from_starts_ends(
-            varlen_starts[q_start:q_end],
-            varlen_ends[q_start:q_end],
-            key_positions[k_start:k_end],
+            varlen_starts[q_start:q_end], varlen_ends[q_start:q_end], key_positions[k_start:k_end]
         )
         return valid.unsqueeze(0).expand(b, -1, -1), None
 
@@ -957,15 +949,11 @@ def _indexer_loss_block_mask(
 
 
 def _masked_block_logits(
-    logits: torch.Tensor,
-    valid_mask: torch.Tensor,
-    additive_bias: Optional[torch.Tensor],
+    logits: torch.Tensor, valid_mask: torch.Tensor, additive_bias: Optional[torch.Tensor]
 ) -> torch.Tensor:
     """Apply a broadcastable additive bias and validity mask to block logits."""
     if additive_bias is not None:
-        logits = logits + (
-            additive_bias.unsqueeze(1) if logits.ndim == 4 else additive_bias
-        )
+        logits = logits + (additive_bias.unsqueeze(1) if logits.ndim == 4 else additive_bias)
     block_valid = valid_mask.unsqueeze(1) if logits.ndim == 4 else valid_mask
     return logits.masked_fill(~block_valid, float("-inf"))
 
@@ -1070,12 +1058,8 @@ def _blockwise_loss_normalizers(
     sk = k.size(0)
     np = query.size(2)
     q_rows = q_end - q_start
-    teacher_norm = torch.full(
-        (b, np, q_rows), float("-inf"), dtype=torch.float32, device=q.device
-    )
-    student_norm = torch.full(
-        (b, q_rows), float("-inf"), dtype=torch.float32, device=q.device
-    )
+    teacher_norm = torch.full((b, np, q_rows), float("-inf"), dtype=torch.float32, device=q.device)
+    student_norm = torch.full((b, q_rows), float("-inf"), dtype=torch.float32, device=q.device)
 
     for k_start in range(0, sk, block_size):
         k_end = min(k_start + block_size, sk)
@@ -1101,12 +1085,8 @@ def _blockwise_loss_normalizers(
             q[q_start:q_end], weights[q_start:q_end], k[k_start:k_end], use_relu=use_relu
         )
         student_logits = _masked_block_logits(student_logits, valid, bias)
-        teacher_norm = torch.logaddexp(
-            teacher_norm, torch.logsumexp(teacher_logits, dim=-1)
-        )
-        student_norm = torch.logaddexp(
-            student_norm, torch.logsumexp(student_logits, dim=-1)
-        )
+        teacher_norm = torch.logaddexp(teacher_norm, torch.logsumexp(teacher_logits, dim=-1))
+        student_norm = torch.logaddexp(student_norm, torch.logsumexp(student_logits, dim=-1))
     return teacher_norm, student_norm
 
 
@@ -1223,22 +1203,15 @@ def fwd_blockwise_indexer_loss(
                 query[q_start:q_end], key[k_start:k_end], softmax_scale
             )
             teacher_logits = _masked_block_logits(teacher_logits, valid, bias)
-            target = _blockwise_teacher_target(
-                teacher_logits, teacher_norm, valid, pg_collection
-            )
+            target = _blockwise_teacher_target(teacher_logits, teacher_norm, valid, pg_collection)
             student_logits = _compute_index_scores(
-                q[q_start:q_end],
-                weights[q_start:q_end],
-                k[k_start:k_end],
-                use_relu=use_relu,
+                q[q_start:q_end], weights[q_start:q_end], k[k_start:k_end], use_relu=use_relu
             )
             student_logits = _masked_block_logits(student_logits, valid, bias)
             student_log_probs = (student_logits - student_norm.unsqueeze(-1)).masked_fill(
                 ~valid, 0.0
             )
-            row_kl += dsa_indexer_loss.indexer_kl_per_row(
-                target, student_log_probs, valid
-            )
+            row_kl += dsa_indexer_loss.indexer_kl_per_row(target, student_log_probs, valid)
         if query_valid_rows is not None:
             row_kl *= query_valid_rows[:, q_start:q_end].to(dtype=row_kl.dtype)
         kl_sum += row_kl.sum()
@@ -1350,14 +1323,9 @@ def bwd_blockwise_indexer_loss(
                 query[q_start:q_end], key[k_start:k_end], softmax_scale
             )
             teacher_logits = _masked_block_logits(teacher_logits, valid, bias)
-            target = _blockwise_teacher_target(
-                teacher_logits, teacher_norm, valid, pg_collection
-            )
+            target = _blockwise_teacher_target(teacher_logits, teacher_norm, valid, pg_collection)
             student_logits = _compute_index_scores(
-                q[q_start:q_end],
-                weights[q_start:q_end],
-                k[k_start:k_end],
-                use_relu=use_relu,
+                q[q_start:q_end], weights[q_start:q_end], k[k_start:k_end], use_relu=use_relu
             )
             student_logits = _masked_block_logits(student_logits, valid, bias)
             student_prob = _block_probabilities(student_logits, student_norm, valid)
@@ -1365,15 +1333,11 @@ def bwd_blockwise_indexer_loss(
             grad_index_scores = grad_index_scores.masked_fill(~valid, 0.0).transpose(0, 1)
 
             raw_scores = torch.einsum(
-                "sbhd,tbd->sbht",
-                q[q_start:q_end].float(),
-                k[k_start:k_end].float(),
+                "sbhd,tbd->sbht", q[q_start:q_end].float(), k[k_start:k_end].float()
             )
             activated_scores = torch.relu(raw_scores) if use_relu else raw_scores
             grad_weighted_scores = grad_index_scores.unsqueeze(2)
-            grad_weights[q_start:q_end] += (
-                grad_weighted_scores * activated_scores
-            ).sum(dim=-1)
+            grad_weights[q_start:q_end] += (grad_weighted_scores * activated_scores).sum(dim=-1)
             grad_scores = grad_weighted_scores * weights[q_start:q_end].float().unsqueeze(-1)
             if use_relu:
                 grad_scores *= raw_scores > 0
@@ -1514,9 +1478,7 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
             "query": None,
             "key": None,
         }
-        gradients = tuple(
-            grad_by_name.get(name) for name in _FUSED_DSA_INDEXER_LOSS_INPUT_NAMES
-        )
+        gradients = tuple(grad_by_name.get(name) for name in _FUSED_DSA_INDEXER_LOSS_INPUT_NAMES)
         return gradients[: ctx.input_count]
 
 
@@ -1648,9 +1610,7 @@ class DSAIndexer(MegatronModule):
         )
         self.q_lora_rank = getattr(self.config, "q_lora_rank", None) or self.config.hidden_size
         self.rope_type = (
-            getattr(self.config, "rope_type", None)
-            or self.config.dsa_indexer_rope_type
-            or "rope"
+            getattr(self.config, "rope_type", None) or self.config.dsa_indexer_rope_type or "rope"
         )
         self.rotary_base = (
             getattr(self.config, "rotary_base", None)
@@ -1698,13 +1658,9 @@ class DSAIndexer(MegatronModule):
                 beta_slow=getattr(
                     self.config, "beta_slow", getattr(self.config, "yarn_beta_slow", 1.0)
                 ),
-                mscale=getattr(
-                    self.config, "mscale", getattr(self.config, "yarn_mscale", 1.0)
-                ),
+                mscale=getattr(self.config, "mscale", getattr(self.config, "yarn_mscale", 1.0)),
                 mscale_all_dim=getattr(
-                    self.config,
-                    "mscale_all_dim",
-                    getattr(self.config, "yarn_mscale_all_dim", 0.0),
+                    self.config, "mscale_all_dim", getattr(self.config, "yarn_mscale_all_dim", 0.0)
                 ),
                 cp_group=self.pg_collection.cp,
             )
