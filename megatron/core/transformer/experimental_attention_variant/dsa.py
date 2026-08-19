@@ -917,6 +917,476 @@ def bwd_fused_indexer_loss_naive(
     return grad_q.to(q.dtype), grad_weights.to(weights.dtype), grad_k.to(k.dtype)
 
 
+def _indexer_loss_block_mask(
+    *,
+    mask: Optional[torch.Tensor],
+    varlen_starts: Optional[torch.Tensor],
+    varlen_ends: Optional[torch.Tensor],
+    key_positions: Optional[torch.Tensor],
+    q_start: int,
+    q_end: int,
+    k_start: int,
+    k_end: int,
+    b: int,
+    device: torch.device,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Return validity and additive bias for one query/key loss block."""
+    if varlen_starts is not None:
+        valid = dsa_masking.build_valid_mask_from_starts_ends(
+            varlen_starts[q_start:q_end],
+            varlen_ends[q_start:q_end],
+            key_positions[k_start:k_end],
+        )
+        return valid.unsqueeze(0).expand(b, -1, -1), None
+
+    if mask is None:
+        query_positions = torch.arange(q_start, q_end, dtype=torch.int64, device=device)
+        block_key_positions = torch.arange(k_start, k_end, dtype=torch.int64, device=device)
+        valid = block_key_positions.unsqueeze(0) <= query_positions.unsqueeze(-1)
+        return valid.unsqueeze(0).expand(b, -1, -1), None
+
+    bias = (
+        mask[q_start:q_end, k_start:k_end]
+        if mask.ndim == 2
+        else mask[:, q_start:q_end, k_start:k_end]
+    )
+    if bias.ndim == 2:
+        bias = bias.unsqueeze(0)
+    valid = torch.isfinite(bias).expand(b, -1, -1)
+    return valid, bias
+
+
+def _masked_block_logits(
+    logits: torch.Tensor,
+    valid_mask: torch.Tensor,
+    additive_bias: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Apply a broadcastable additive bias and validity mask to block logits."""
+    if additive_bias is not None:
+        logits = logits + (
+            additive_bias.unsqueeze(1) if logits.ndim == 4 else additive_bias
+        )
+    block_valid = valid_mask.unsqueeze(1) if logits.ndim == 4 else valid_mask
+    return logits.masked_fill(~block_valid, float("-inf"))
+
+
+def _block_probabilities(
+    logits: torch.Tensor, log_normalizer: torch.Tensor, valid_mask: torch.Tensor
+) -> torch.Tensor:
+    """Recover probabilities for a block, including fully masked rows."""
+    block_valid = valid_mask.unsqueeze(1) if logits.ndim == 4 else valid_mask
+    probabilities = torch.exp(logits - log_normalizer.unsqueeze(-1))
+    return probabilities.masked_fill(~block_valid, 0.0)
+
+
+def _build_sparse_support(topk_indices: torch.Tensor, sk: int) -> torch.Tensor:
+    """Build boolean top-k support for one query block."""
+    support = torch.zeros(
+        (*topk_indices.shape[:2], sk + 1), dtype=torch.bool, device=topk_indices.device
+    )
+    valid = topk_indices >= 0
+    safe_indices = torch.where(valid, topk_indices, torch.full_like(topk_indices, sk))
+    support.scatter_(dim=-1, index=safe_indices, src=valid)
+    return support[..., :sk]
+
+
+def _blockwise_indexer_topk(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    k: torch.Tensor,
+    index_topk: int,
+    *,
+    mask: Optional[torch.Tensor],
+    varlen_starts: Optional[torch.Tensor],
+    varlen_ends: Optional[torch.Tensor],
+    key_positions: Optional[torch.Tensor],
+    block_size: int,
+    use_relu: bool,
+) -> torch.Tensor:
+    """Select indexer top-k while bounding score workspace by two block axes."""
+    sq, b = q.shape[:2]
+    sk = k.size(0)
+    topk_k = min(index_topk, sk)
+    if topk_k <= 0:
+        return torch.empty((b, sq, 0), dtype=torch.int64, device=q.device)
+
+    topk_indices = torch.empty((b, sq, topk_k), dtype=torch.int64, device=q.device)
+    for q_start in range(0, sq, block_size):
+        q_end = min(q_start + block_size, sq)
+        block_scores = None
+        block_indices = None
+        for k_start in range(0, sk, block_size):
+            k_end = min(k_start + block_size, sk)
+            scores = _compute_index_scores(
+                q[q_start:q_end], weights[q_start:q_end], k[k_start:k_end], use_relu=use_relu
+            )
+            valid, bias = _indexer_loss_block_mask(
+                mask=mask,
+                varlen_starts=varlen_starts,
+                varlen_ends=varlen_ends,
+                key_positions=key_positions,
+                q_start=q_start,
+                q_end=q_end,
+                k_start=k_start,
+                k_end=k_end,
+                b=b,
+                device=q.device,
+            )
+            scores = _masked_block_logits(scores, valid, bias)
+            indices = torch.arange(k_start, k_end, dtype=torch.int64, device=q.device)
+            indices = indices.view(1, 1, -1).expand(b, q_end - q_start, -1)
+            if block_scores is not None:
+                scores = torch.cat((block_scores, scores), dim=-1)
+                indices = torch.cat((block_indices, indices), dim=-1)
+            keep = min(topk_k, scores.size(-1))
+            block_scores, order = scores.topk(keep, dim=-1)
+            block_indices = torch.gather(indices, dim=-1, index=order)
+
+        block_indices = block_indices.masked_fill(block_scores == float("-inf"), -1)
+        topk_indices[:, q_start:q_end] = block_indices
+    return topk_indices
+
+
+def _blockwise_loss_normalizers(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    k: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    softmax_scale: float,
+    *,
+    mask: Optional[torch.Tensor],
+    varlen_starts: Optional[torch.Tensor],
+    varlen_ends: Optional[torch.Tensor],
+    key_positions: Optional[torch.Tensor],
+    sparse_support: Optional[torch.Tensor],
+    q_start: int,
+    q_end: int,
+    block_size: int,
+    use_relu: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute teacher and student log-normalizers without full score tensors."""
+    b = q.size(1)
+    sk = k.size(0)
+    np = query.size(2)
+    q_rows = q_end - q_start
+    teacher_norm = torch.full(
+        (b, np, q_rows), float("-inf"), dtype=torch.float32, device=q.device
+    )
+    student_norm = torch.full(
+        (b, q_rows), float("-inf"), dtype=torch.float32, device=q.device
+    )
+
+    for k_start in range(0, sk, block_size):
+        k_end = min(k_start + block_size, sk)
+        valid, bias = _indexer_loss_block_mask(
+            mask=mask,
+            varlen_starts=varlen_starts,
+            varlen_ends=varlen_ends,
+            key_positions=key_positions,
+            q_start=q_start,
+            q_end=q_end,
+            k_start=k_start,
+            k_end=k_end,
+            b=b,
+            device=q.device,
+        )
+        if sparse_support is not None:
+            valid = valid & sparse_support[..., k_start:k_end]
+        teacher_logits = _compute_grouped_attention_scores(
+            query[q_start:q_end], key[k_start:k_end], softmax_scale
+        )
+        teacher_logits = _masked_block_logits(teacher_logits, valid, bias)
+        student_logits = _compute_index_scores(
+            q[q_start:q_end], weights[q_start:q_end], k[k_start:k_end], use_relu=use_relu
+        )
+        student_logits = _masked_block_logits(student_logits, valid, bias)
+        teacher_norm = torch.logaddexp(
+            teacher_norm, torch.logsumexp(teacher_logits, dim=-1)
+        )
+        student_norm = torch.logaddexp(
+            student_norm, torch.logsumexp(student_logits, dim=-1)
+        )
+    return teacher_norm, student_norm
+
+
+def _blockwise_teacher_target(
+    teacher_logits: torch.Tensor,
+    teacher_norm: torch.Tensor,
+    valid_mask: torch.Tensor,
+    pg_collection: ProcessGroupCollection,
+) -> torch.Tensor:
+    """Average a teacher-probability block over global query heads."""
+    target = _block_probabilities(teacher_logits, teacher_norm, valid_mask).sum(dim=1)
+    if pg_collection.tp.size() > 1:
+        torch.distributed.all_reduce(target, group=pg_collection.tp)
+    return target / (teacher_logits.size(1) * pg_collection.tp.size())
+
+
+def fwd_blockwise_indexer_loss(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    k: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    topk: int,
+    softmax_scale: float,
+    loss_coeff: float,
+    mask: Optional[torch.Tensor],
+    sparse_loss: bool,
+    pg_collection: ProcessGroupCollection,
+    varlen_starts: Optional[torch.Tensor] = None,
+    varlen_ends: Optional[torch.Tensor] = None,
+    key_positions: Optional[torch.Tensor] = None,
+    query_valid_rows: Optional[torch.Tensor] = None,
+    calculate_per_token_loss: bool = False,
+    use_relu: bool = True,
+    block_size: int = 256,
+    compute_topk: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute top-k and Design-A KL with bounded query/key score blocks."""
+    query, _ = dsa_layout.ensure_sbhd(query, "query")
+    key, _ = dsa_layout.ensure_sbhd(key, "key")
+    sq, b = q.shape[:2]
+    sk = k.size(0)
+    block_size = max(1, int(block_size))
+    query_valid_rows = dsa_masking.normalize_query_valid_rows(
+        query_valid_rows, b=b, sq=sq, device=q.device
+    )
+    varlen_starts, varlen_ends, key_positions = dsa_masking.normalize_varlen_bounds(
+        mask=mask,
+        varlen_starts=varlen_starts,
+        varlen_ends=varlen_ends,
+        key_positions=key_positions,
+        sk=sk,
+        device=q.device,
+    )
+    if sparse_loss and not compute_topk:
+        raise ValueError("Sparse indexer loss requires top-k computation.")
+    if compute_topk:
+        topk_indices = _blockwise_indexer_topk(
+            q,
+            weights,
+            k,
+            topk,
+            mask=mask,
+            varlen_starts=varlen_starts,
+            varlen_ends=varlen_ends,
+            key_positions=key_positions,
+            block_size=block_size,
+            use_relu=use_relu,
+        )
+    else:
+        topk_indices = torch.empty((b, sq, 0), dtype=torch.int64, device=q.device)
+
+    kl_sum = torch.zeros((), dtype=torch.float32, device=q.device)
+    for q_start in range(0, sq, block_size):
+        q_end = min(q_start + block_size, sq)
+        sparse_support = (
+            _build_sparse_support(topk_indices[:, q_start:q_end], sk) if sparse_loss else None
+        )
+        teacher_norm, student_norm = _blockwise_loss_normalizers(
+            q,
+            weights,
+            k,
+            query,
+            key,
+            softmax_scale,
+            mask=mask,
+            varlen_starts=varlen_starts,
+            varlen_ends=varlen_ends,
+            key_positions=key_positions,
+            sparse_support=sparse_support,
+            q_start=q_start,
+            q_end=q_end,
+            block_size=block_size,
+            use_relu=use_relu,
+        )
+        row_kl = torch.zeros((b, q_end - q_start), dtype=torch.float32, device=q.device)
+        for k_start in range(0, sk, block_size):
+            k_end = min(k_start + block_size, sk)
+            valid, bias = _indexer_loss_block_mask(
+                mask=mask,
+                varlen_starts=varlen_starts,
+                varlen_ends=varlen_ends,
+                key_positions=key_positions,
+                q_start=q_start,
+                q_end=q_end,
+                k_start=k_start,
+                k_end=k_end,
+                b=b,
+                device=q.device,
+            )
+            if sparse_support is not None:
+                valid = valid & sparse_support[..., k_start:k_end]
+            teacher_logits = _compute_grouped_attention_scores(
+                query[q_start:q_end], key[k_start:k_end], softmax_scale
+            )
+            teacher_logits = _masked_block_logits(teacher_logits, valid, bias)
+            target = _blockwise_teacher_target(
+                teacher_logits, teacher_norm, valid, pg_collection
+            )
+            student_logits = _compute_index_scores(
+                q[q_start:q_end],
+                weights[q_start:q_end],
+                k[k_start:k_end],
+                use_relu=use_relu,
+            )
+            student_logits = _masked_block_logits(student_logits, valid, bias)
+            student_log_probs = (student_logits - student_norm.unsqueeze(-1)).masked_fill(
+                ~valid, 0.0
+            )
+            row_kl += dsa_indexer_loss.indexer_kl_per_row(
+                target, student_log_probs, valid
+            )
+        if query_valid_rows is not None:
+            row_kl *= query_valid_rows[:, q_start:q_end].to(dtype=row_kl.dtype)
+        kl_sum += row_kl.sum()
+
+    valid_row_count = query_valid_rows.sum() if query_valid_rows is not None else None
+    loss = dsa_indexer_loss.reduce_indexer_kl_sum(
+        kl_sum,
+        num_rows=b * sq,
+        calculate_per_token_loss=calculate_per_token_loss,
+        valid_row_count=valid_row_count,
+    )
+    return topk_indices, loss * loss_coeff
+
+
+def bwd_blockwise_indexer_loss(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    k: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    topk_indices: torch.Tensor,
+    softmax_scale: float,
+    loss_coeff: float,
+    sparse_loss: bool,
+    mask: Optional[torch.Tensor],
+    grad_loss: torch.Tensor,
+    pg_collection: ProcessGroupCollection,
+    varlen_starts: Optional[torch.Tensor] = None,
+    varlen_ends: Optional[torch.Tensor] = None,
+    key_positions: Optional[torch.Tensor] = None,
+    query_valid_rows: Optional[torch.Tensor] = None,
+    calculate_per_token_loss: bool = False,
+    use_relu: bool = True,
+    block_size: int = 256,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Recompute blockwise probabilities and accumulate exact indexer gradients."""
+    query, _ = dsa_layout.ensure_sbhd(query, "query")
+    key, _ = dsa_layout.ensure_sbhd(key, "key")
+    sq, b = q.shape[:2]
+    sk = k.size(0)
+    block_size = max(1, int(block_size))
+    query_valid_rows = dsa_masking.normalize_query_valid_rows(
+        query_valid_rows, b=b, sq=sq, device=q.device
+    )
+    varlen_starts, varlen_ends, key_positions = dsa_masking.normalize_varlen_bounds(
+        mask=mask,
+        varlen_starts=varlen_starts,
+        varlen_ends=varlen_ends,
+        key_positions=key_positions,
+        sk=sk,
+        device=q.device,
+    )
+    if calculate_per_token_loss:
+        row_scale = grad_loss.float() * loss_coeff
+    else:
+        valid_row_count = (
+            query_valid_rows.sum().float()
+            if query_valid_rows is not None
+            else torch.tensor(float(b * sq), dtype=torch.float32, device=q.device)
+        ).clamp_min(1.0)
+        row_scale = grad_loss.float() * loss_coeff / valid_row_count
+
+    grad_q = torch.zeros_like(q, dtype=torch.float32)
+    grad_weights = torch.zeros_like(weights, dtype=torch.float32)
+    grad_k = torch.zeros_like(k, dtype=torch.float32)
+    for q_start in range(0, sq, block_size):
+        q_end = min(q_start + block_size, sq)
+        sparse_support = (
+            _build_sparse_support(topk_indices[:, q_start:q_end], sk) if sparse_loss else None
+        )
+        teacher_norm, student_norm = _blockwise_loss_normalizers(
+            q,
+            weights,
+            k,
+            query,
+            key,
+            softmax_scale,
+            mask=mask,
+            varlen_starts=varlen_starts,
+            varlen_ends=varlen_ends,
+            key_positions=key_positions,
+            sparse_support=sparse_support,
+            q_start=q_start,
+            q_end=q_end,
+            block_size=block_size,
+            use_relu=use_relu,
+        )
+        block_row_scale = row_scale
+        if query_valid_rows is not None:
+            block_row_scale = row_scale * query_valid_rows[:, q_start:q_end].unsqueeze(-1).float()
+
+        for k_start in range(0, sk, block_size):
+            k_end = min(k_start + block_size, sk)
+            valid, bias = _indexer_loss_block_mask(
+                mask=mask,
+                varlen_starts=varlen_starts,
+                varlen_ends=varlen_ends,
+                key_positions=key_positions,
+                q_start=q_start,
+                q_end=q_end,
+                k_start=k_start,
+                k_end=k_end,
+                b=b,
+                device=q.device,
+            )
+            if sparse_support is not None:
+                valid = valid & sparse_support[..., k_start:k_end]
+            teacher_logits = _compute_grouped_attention_scores(
+                query[q_start:q_end], key[k_start:k_end], softmax_scale
+            )
+            teacher_logits = _masked_block_logits(teacher_logits, valid, bias)
+            target = _blockwise_teacher_target(
+                teacher_logits, teacher_norm, valid, pg_collection
+            )
+            student_logits = _compute_index_scores(
+                q[q_start:q_end],
+                weights[q_start:q_end],
+                k[k_start:k_end],
+                use_relu=use_relu,
+            )
+            student_logits = _masked_block_logits(student_logits, valid, bias)
+            student_prob = _block_probabilities(student_logits, student_norm, valid)
+            grad_index_scores = (student_prob - target) * block_row_scale
+            grad_index_scores = grad_index_scores.masked_fill(~valid, 0.0).transpose(0, 1)
+
+            raw_scores = torch.einsum(
+                "sbhd,tbd->sbht",
+                q[q_start:q_end].float(),
+                k[k_start:k_end].float(),
+            )
+            activated_scores = torch.relu(raw_scores) if use_relu else raw_scores
+            grad_weighted_scores = grad_index_scores.unsqueeze(2)
+            grad_weights[q_start:q_end] += (
+                grad_weighted_scores * activated_scores
+            ).sum(dim=-1)
+            grad_scores = grad_weighted_scores * weights[q_start:q_end].float().unsqueeze(-1)
+            if use_relu:
+                grad_scores *= raw_scores > 0
+            grad_q[q_start:q_end] += torch.einsum(
+                "sbht,tbd->sbhd", grad_scores, k[k_start:k_end].float()
+            )
+            grad_k[k_start:k_end] += torch.einsum(
+                "sbht,sbhd->tbd", grad_scores, q[q_start:q_end].float()
+            )
+
+    return grad_q.to(q.dtype), grad_weights.to(weights.dtype), grad_k.to(k.dtype)
+
+
 _FUSED_DSA_INDEXER_LOSS_INPUT_NAMES = (
     "q",
     "weights",
@@ -935,6 +1405,8 @@ _FUSED_DSA_INDEXER_LOSS_INPUT_NAMES = (
     "query_valid_rows",
     "calculate_per_token_loss",
     "use_relu",
+    "block_size",
+    "compute_topk",
 )
 
 
@@ -961,11 +1433,11 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
         query_valid_rows=None,
         calculate_per_token_loss: bool = False,
         use_relu: bool = True,
+        block_size: int = 256,
+        compute_topk: bool = True,
     ):
-        """
-        Fused forward: index_scores never materialized in full.
-        """
-        topk_indices, loss = fwd_fused_indexer_loss_naive(
+        """Compute top-k and indexer loss without full score tensors."""
+        topk_indices, loss = fwd_blockwise_indexer_loss(
             q,
             weights,
             k,
@@ -983,6 +1455,8 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
             query_valid_rows=query_valid_rows,
             calculate_per_token_loss=calculate_per_token_loss,
             use_relu=use_relu,
+            block_size=block_size,
+            compute_topk=compute_topk,
         )
 
         # Save for backward (recomputation strategy)
@@ -998,6 +1472,8 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
         ctx.query_valid_rows = query_valid_rows
         ctx.calculate_per_token_loss = calculate_per_token_loss
         ctx.use_relu = use_relu
+        ctx.block_size = block_size
+        ctx.input_count = len(ctx.needs_input_grad)
 
         return topk_indices, loss
 
@@ -1008,7 +1484,7 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
         """
         q, weights, k, query, key, topk_indices = ctx.saved_tensors
 
-        grad_q, grad_weights, grad_k = bwd_fused_indexer_loss_naive(
+        grad_q, grad_weights, grad_k = bwd_blockwise_indexer_loss(
             q,
             weights,
             k,
@@ -1027,6 +1503,7 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
             query_valid_rows=ctx.query_valid_rows,
             calculate_per_token_loss=ctx.calculate_per_token_loss,
             use_relu=ctx.use_relu,
+            block_size=ctx.block_size,
         )
 
         grad_by_name = {
@@ -1037,7 +1514,10 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
             "query": None,
             "key": None,
         }
-        return tuple(grad_by_name.get(name) for name in _FUSED_DSA_INDEXER_LOSS_INPUT_NAMES)
+        gradients = tuple(
+            grad_by_name.get(name) for name in _FUSED_DSA_INDEXER_LOSS_INPUT_NAMES
+        )
+        return gradients[: ctx.input_count]
 
 
 class DSAIndexerLossAutoScaler(torch.autograd.Function):
@@ -2131,7 +2611,7 @@ class DSAttention(MegatronModule):
                     q = q[row_start:row_end].contiguous()
                     weights = weights[row_start:row_end].contiguous()
 
-        def compute_indexer_loss_with_reference_path():
+        def compute_indexer_loss_with_blockwise_path():
             key_for_loss = key.detach()
             if absorbed_mla and key_for_loss.size(2) == 1 and query.size(2) > 1:
                 key_for_loss = key_for_loss.expand(-1, -1, query.size(2), -1)
@@ -2153,6 +2633,8 @@ class DSAttention(MegatronModule):
                 query_valid_rows,
                 self.config.calculate_per_token_loss,
                 self.config.dsa_indexer_scoring_relu,
+                self.config.dsa_indexer_loss_block_size,
+                dense_output is None,
             )
 
         fused_output = None
@@ -2275,7 +2757,7 @@ class DSAttention(MegatronModule):
                     topk_indices, topk_length, indexer_loss = fused_topk_with_loss
 
             if topk_indices is None or indexer_loss is None:
-                topk_indices, indexer_loss = compute_indexer_loss_with_reference_path()
+                topk_indices, indexer_loss = compute_indexer_loss_with_blockwise_path()
             # No TP-local top-k slicing here: the guard above forbids the indexer loss
             # under sequence-local TP query shards, so the top-k rows are already global.
 

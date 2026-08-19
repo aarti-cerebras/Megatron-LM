@@ -326,6 +326,9 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_loss_coeff: Optional[float] = None
     """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
 
+    dsa_indexer_loss_block_size: int = 256
+    """Query/key block size for memory-bounded DSA indexer KL loss computation."""
+
     dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
@@ -1460,6 +1463,8 @@ class TransformerConfig(ModelParallelConfig):
             )
         elif self.experimental_attention_variant in ("dsa", "dsa_gqa"):
             _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
+            if self.dsa_indexer_loss_block_size < 1:
+                raise ValueError("dsa_indexer_loss_block_size must be positive.")
             if self.experimental_attention_variant == "dsa" and self.add_bias_linear:
                 raise ValueError(
                     "DSA uses AbsorbedMLASelfAttention, which requires add_bias_linear=False. "

@@ -104,6 +104,11 @@ def test_dsa_gqa_rejects_incoherent_dense_warmup():
         _dsa_gqa_config(dsa_freeze_base=False)
 
 
+def test_dsa_gqa_rejects_nonpositive_loss_block_size():
+    with pytest.raises(ValueError, match="dsa_indexer_loss_block_size must be positive"):
+        _dsa_gqa_config(dsa_indexer_loss_block_size=0)
+
+
 def test_fp8_fake_quant_matches_ue8m0_reference_and_preserves_gradient():
     values = torch.tensor(
         [[-3.25, -0.125, 0.0, 1.75], [0.015625, 0.25, 2.0, 5.0]], requires_grad=True

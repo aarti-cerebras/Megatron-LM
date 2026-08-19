@@ -28,6 +28,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttention,
     DSAttentionSubmodules,
     FusedDSAIndexerLoss,
+    _compute_grouped_attention_scores,
     _run_sparse_attention,
     _validate_nonpacked_cp_uniform_length,
     compute_dsa_indexer_loss,
@@ -1840,6 +1841,7 @@ class TestComputeDSAIndexerLoss:
             query_valid_rows,
             False,
             False,
+            2,
         )
 
         assert torch.isfinite(loss)
@@ -1973,7 +1975,7 @@ class TestFusedDSAIndexerLossGradient:
                     seqlen, batch_size, num_heads, head_dim, dtype=torch.bfloat16
                 ).cuda()
                 key = torch.randn(
-                    seqlen, batch_size, num_heads, head_dim, dtype=torch.bfloat16
+                    seqlen, batch_size, num_heads // 2, head_dim, dtype=torch.bfloat16
                 ).cuda()
                 mask = torch.triu(
                     torch.full((seqlen, seqlen), float('-inf'), dtype=torch.float32).cuda(),
@@ -2021,6 +2023,10 @@ class TestFusedDSAIndexerLossGradient:
                     None,
                     None,
                     None,
+                    None,
+                    False,
+                    True,
+                    seqlen,
                 )
                 loss_fused.backward()
 
@@ -2048,6 +2054,105 @@ class TestFusedDSAIndexerLossGradient:
                 assert torch.allclose(
                     grad_k_fused, grad_k_ref, rtol=1e-5, atol=1e-5
                 ), f"{tag} grad_k mismatch: max diff = {(grad_k_fused - grad_k_ref).abs().max().item()}"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_blockwise_indexer_loss_matches_single_block(self):
+        """Multiple score blocks preserve GQA loss, top-k, and indexer gradients."""
+        torch.manual_seed(42)
+        seqlen = 17
+        batch_size = 2
+        q = torch.randn(seqlen, batch_size, 4, 8, device="cuda")
+        weights = torch.randn(seqlen, batch_size, 4, device="cuda")
+        k = torch.randn(seqlen, batch_size, 8, device="cuda")
+        query = torch.randn(seqlen, batch_size, 4, 8, dtype=torch.bfloat16, device="cuda")
+        key = torch.randn(seqlen, batch_size, 2, 8, dtype=torch.bfloat16, device="cuda")
+        mask = torch.triu(
+            torch.full((seqlen, seqlen), float("-inf"), device="cuda"), diagonal=1
+        )
+
+        results = []
+        for block_size in (seqlen, 5):
+            q_test = q.clone().requires_grad_(True)
+            weights_test = weights.clone().requires_grad_(True)
+            k_test = k.clone().requires_grad_(True)
+            with patch(
+                "megatron.core.transformer.experimental_attention_variant.dsa."
+                "_compute_grouped_attention_scores",
+                wraps=_compute_grouped_attention_scores,
+            ) as grouped_scores:
+                topk_indices, loss = FusedDSAIndexerLoss.apply(
+                    q_test,
+                    weights_test,
+                    k_test,
+                    query,
+                    key,
+                    8**-0.5,
+                    8,
+                    1.0,
+                    mask,
+                    False,
+                    self.pg_collection,
+                    None,
+                    None,
+                    None,
+                    None,
+                    False,
+                    True,
+                    block_size,
+                )
+                loss.backward()
+            if block_size == 5:
+                assert grouped_scores.call_count > 1
+                assert all(
+                    call.args[0].size(0) <= block_size
+                    and call.args[1].size(0) <= block_size
+                    for call in grouped_scores.call_args_list
+                )
+            results.append((topk_indices, loss, q_test.grad, weights_test.grad, k_test.grad))
+
+        single_block, multiple_blocks = results
+        topk_overlap = (
+            (multiple_blocks[0].unsqueeze(-1) == single_block[0].unsqueeze(-2))
+            .any(dim=-1)
+            .float()
+            .mean()
+        )
+        assert topk_overlap >= 0.95
+        torch.testing.assert_close(multiple_blocks[1], single_block[1], rtol=1e-5, atol=1e-5)
+        for actual, expected in zip(multiple_blocks[2:], single_block[2:]):
+            torch.testing.assert_close(actual, expected, rtol=1e-2, atol=5e-4)
+
+        q_no_topk = q.clone().requires_grad_(True)
+        weights_no_topk = weights.clone().requires_grad_(True)
+        k_no_topk = k.clone().requires_grad_(True)
+        no_topk, loss_no_topk = FusedDSAIndexerLoss.apply(
+            q_no_topk,
+            weights_no_topk,
+            k_no_topk,
+            query,
+            key,
+            8**-0.5,
+            8,
+            1.0,
+            mask,
+            False,
+            self.pg_collection,
+            None,
+            None,
+            None,
+            None,
+            False,
+            True,
+            5,
+            False,
+        )
+        loss_no_topk.backward()
+        assert no_topk.shape == (batch_size, seqlen, 0)
+        torch.testing.assert_close(loss_no_topk, multiple_blocks[1])
+        for actual, expected in zip(
+            (q_no_topk.grad, weights_no_topk.grad, k_no_topk.grad), multiple_blocks[2:]
+        ):
+            torch.testing.assert_close(actual, expected)
 
 
 class TestFusedDSAIndexerLossGradientTP:
@@ -2121,6 +2226,10 @@ class TestFusedDSAIndexerLossGradientTP:
                 None,
                 None,
                 None,
+                None,
+                False,
+                True,
+                13,
             )
             loss_tp1.backward()
 
@@ -2180,6 +2289,10 @@ class TestFusedDSAIndexerLossGradientTP:
                     None,
                     None,
                     None,
+                    None,
+                    False,
+                    True,
+                    13,
                 )
                 loss_tpn.backward()
 
