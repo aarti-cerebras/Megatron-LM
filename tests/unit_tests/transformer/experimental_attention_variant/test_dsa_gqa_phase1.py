@@ -13,6 +13,8 @@ from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttention,
     _compute_grouped_attention_scores,
+    _compute_index_scores,
+    _fake_quant_fp8,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -47,6 +49,9 @@ def _dsa_gqa_config(**overrides):
         dsa_indexer_head_dim=64,
         dsa_indexer_topk=32,
         dsa_indexer_loss_coeff=1.0,
+        dsa_indexer_fp8=True,
+        dsa_indexer_fp8_ue8m0=True,
+        dsa_indexer_serving_compat=True,
         dsa_dense_warmup=True,
         dsa_freeze_base=True,
         dsa_kernel_backend="none",
@@ -97,3 +102,70 @@ def test_dsa_gqa_rejects_sliding_window_overlap():
 def test_dsa_gqa_rejects_incoherent_dense_warmup():
     with pytest.raises(ValueError, match="requires dsa_freeze_base=True"):
         _dsa_gqa_config(dsa_freeze_base=False)
+
+
+def test_fp8_fake_quant_matches_ue8m0_reference_and_preserves_gradient():
+    values = torch.tensor(
+        [[-3.25, -0.125, 0.0, 1.75], [0.015625, 0.25, 2.0, 5.0]], requires_grad=True
+    )
+
+    actual = _fake_quant_fp8(values, use_ue8m0=True)
+
+    fp8_max = float(torch.finfo(torch.float8_e4m3fn).max)
+    amax = values.detach().abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+    scale = torch.pow(2.0, torch.ceil(torch.log2(amax / fp8_max)))
+    expected = (values.detach() / scale).clamp(-fp8_max, fp8_max).to(
+        torch.float8_e4m3fn
+    ).float() * scale
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    actual.sum().backward()
+    torch.testing.assert_close(values.grad, torch.ones_like(values))
+
+
+def test_fp8_fake_quant_tracks_full_precision_index_scores():
+    torch.manual_seed(123)
+    q = torch.randn(16, 1, 4, 64)
+    k = torch.randn(16, 1, 64)
+    weights = torch.rand(16, 1, 4)
+
+    reference = _compute_index_scores(q, weights, k)
+    quantized = _compute_index_scores(_fake_quant_fp8(q), weights, _fake_quant_fp8(k))
+
+    relative_error = (quantized - reference).norm() / reference.norm()
+    assert relative_error.item() < 0.05
+
+
+def test_fp8_serving_padding_preserves_index_scores():
+    torch.manual_seed(123)
+    q = torch.randn(12, 1, 4, 64)
+    k = torch.randn(12, 1, 64)
+    weights = torch.randn(12, 1, 4)
+
+    training_scores = _compute_index_scores(_fake_quant_fp8(q), weights, _fake_quant_fp8(k))
+
+    padded_q = torch.nn.functional.pad(q, (0, 64, 0, 28))
+    padded_k = torch.nn.functional.pad(k, (0, 64))
+    padded_weights = torch.nn.functional.pad(weights, (0, 28))
+    serving_scores = _compute_index_scores(
+        _fake_quant_fp8(padded_q), padded_weights, _fake_quant_fp8(padded_k)
+    )
+
+    torch.testing.assert_close(training_scores, serving_scores, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"dsa_indexer_fp8": False}, "requires dsa_indexer_fp8=True"),
+        ({"dsa_indexer_fp8_ue8m0": False}, "requires UE8M0"),
+        ({"dsa_indexer_rotate_activation": False}, "requires Hadamard"),
+        ({"dsa_indexer_fp8_block_size": 64}, "block_size=128"),
+        ({"dsa_indexer_head_dim": 48}, "head_dim in"),
+        ({"dsa_indexer_n_heads": 0}, "n_heads to divide"),
+        ({"dsa_indexer_n_heads": 12}, "n_heads to divide"),
+    ],
+)
+def test_dsa_gqa_serving_compat_rejects_mismatched_indexer_numerics(overrides, message):
+    with pytest.raises(ValueError, match=message):
+        _dsa_gqa_config(**overrides)

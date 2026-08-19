@@ -350,6 +350,19 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_rotate_activation: bool = True
     """Whether DSA indexer should apply Hadamard rotate_activation to q/k before scoring."""
 
+    dsa_indexer_fp8: bool = False
+    """Whether to fake-quantize DSA indexer q/k to E4M3 before scoring.
+    The straight-through fake quantization trains against serving-time indexer numerics."""
+
+    dsa_indexer_fp8_ue8m0: bool = True
+    """Whether DSA indexer FP8 fake quantization uses power-of-two UE8M0 scales."""
+
+    dsa_indexer_fp8_block_size: int = 128
+    """Serving FP8 quantization block size. DSA-GQA currently uses one scale per indexer row."""
+
+    dsa_indexer_serving_compat: bool = False
+    """Whether to reject DSA indexer configurations that cannot use the serving FP8 kernel."""
+
     dsa_indexer_scoring_relu: bool = True
     """Whether DSA indexer should apply ReLU to q@k^T scores before weighting."""
 
@@ -1463,6 +1476,46 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
             if self.experimental_attention_variant == "dsa_gqa":
+                if self.dsa_indexer_fp8_block_size < 1:
+                    raise ValueError("dsa_indexer_fp8_block_size must be positive.")
+                if self.dsa_indexer_fp8 and self.dsa_indexer_head_dim is not None:
+                    if self.dsa_indexer_head_dim > self.dsa_indexer_fp8_block_size:
+                        raise ValueError(
+                            "dsa_gqa FP8 currently requires one scale per indexer row, but "
+                            f"head_dim={self.dsa_indexer_head_dim} exceeds "
+                            f"block_size={self.dsa_indexer_fp8_block_size}."
+                        )
+                if self.dsa_indexer_serving_compat:
+                    if not self.dsa_indexer_fp8:
+                        raise ValueError(
+                            "dsa_indexer_serving_compat requires dsa_indexer_fp8=True."
+                        )
+                    if not self.dsa_indexer_fp8_ue8m0:
+                        raise ValueError(
+                            "dsa_indexer_serving_compat requires UE8M0 indexer scales."
+                        )
+                    if not self.dsa_indexer_rotate_activation:
+                        raise ValueError(
+                            "dsa_indexer_serving_compat requires Hadamard rotate_activation."
+                        )
+                    if self.dsa_indexer_fp8_block_size != 128:
+                        raise ValueError(
+                            "dsa_indexer_serving_compat requires dsa_indexer_fp8_block_size=128."
+                        )
+                    if self.dsa_indexer_head_dim not in (32, 64, 128):
+                        raise ValueError(
+                            "dsa_indexer_serving_compat requires dsa_indexer_head_dim in "
+                            f"(32, 64, 128), got {self.dsa_indexer_head_dim}."
+                        )
+                    if (
+                        self.dsa_indexer_n_heads is None
+                        or self.dsa_indexer_n_heads < 1
+                        or 128 % self.dsa_indexer_n_heads != 0
+                    ):
+                        raise ValueError(
+                            "dsa_indexer_serving_compat requires dsa_indexer_n_heads to divide "
+                            f"128, got {self.dsa_indexer_n_heads}."
+                        )
                 if self.dsa_indexer_rope_type not in (None, "rope", "yarn"):
                     raise ValueError(
                         "dsa_gqa supports dsa_indexer_rope_type='rope' or 'yarn', got "

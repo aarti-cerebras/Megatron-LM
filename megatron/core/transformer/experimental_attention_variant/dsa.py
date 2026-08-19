@@ -35,6 +35,10 @@ except ImportError:
     hadamard_transform = None
 
 
+_FP8_DTYPE = torch.float8_e4m3fn
+_FP8_MAX = float(torch.finfo(_FP8_DTYPE).max)
+
+
 def is_dsa_skip_topk_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> bool:
     """Return whether a 1-indexed layer reuses a previous DSA top-k result."""
     if layer_number < 1:
@@ -268,6 +272,33 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     assert hadamard_transform is not None, "fast_hadamard_transform is not installed."
     hidden_size = x.size(-1)
     return hadamard_transform(x, scale=hidden_size**-0.5)
+
+
+def _fake_quant_fp8(x: torch.Tensor, use_ue8m0: bool = True) -> torch.Tensor:
+    """Fake-quantize indexer activations to row-wise E4M3 with an STE.
+
+    The serving indexer quantizes one head row at a time. UE8M0 rounds each
+    scale up to a power of two. The returned values match the dequantized FP8
+    forward while the straight-through estimator preserves gradients into the
+    indexer projections.
+
+    Args:
+        x: Indexer query or key activations.
+        use_ue8m0: Whether to use serving-compatible power-of-two scales.
+
+    Returns:
+        Dequantized E4M3 values with identity gradients with respect to ``x``.
+    """
+    with torch.no_grad():
+        amax = x.detach().abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+        scale = amax / _FP8_MAX
+        if use_ue8m0:
+            scale = torch.pow(2.0, torch.ceil(torch.log2(scale)))
+            normalized = (x.detach() / scale).clamp(-_FP8_MAX, _FP8_MAX)
+        else:
+            normalized = x.detach() / scale
+        quantized = normalized.to(_FP8_DTYPE).float() * scale
+    return x + (quantized - x).detach()
 
 
 class DSAIndexerLossLoggingHelper:
@@ -1362,6 +1393,13 @@ class DSAIndexer(MegatronModule):
         if self.config.dsa_indexer_rotate_activation:
             q = rotate_activation(q)
             k = rotate_activation(k)
+
+        # Match the serving indexer's E4M3 q/k numerics while retaining an
+        # identity gradient into the trainable indexer projections.
+        if getattr(self.config, "dsa_indexer_fp8", False):
+            use_ue8m0 = getattr(self.config, "dsa_indexer_fp8_ue8m0", True)
+            q = _fake_quant_fp8(q, use_ue8m0)
+            k = _fake_quant_fp8(k, use_ue8m0)
 
         # =========================================
         # Prepare weights for index scores
