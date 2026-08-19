@@ -1538,6 +1538,12 @@ class Attention(MegatronModule, ABC):
         # core attention computation
         # ==================================
 
+        core_attention_extra_kwargs = {}
+        if getattr(self.core_attention, "requires_dsa_inputs", False):
+            if inference_context is not None:
+                raise RuntimeError("DSA attention does not support inference or KV-cache decode.")
+            core_attention_extra_kwargs = {"x": hidden_states, "qr": hidden_states}
+
         nvtx_range_push(suffix="core_attention")
         core_attn_manager = off_interface(
             self.offload_core_attention and self.training, query, "core_attn"
@@ -1551,6 +1557,7 @@ class Attention(MegatronModule, ABC):
                 attn_mask_type=attn_mask_type,
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
+                core_attention_extra_kwargs=core_attention_extra_kwargs,
             )
         else:
             if inference_context is None or inference_context.is_static_batching():
@@ -1564,6 +1571,7 @@ class Attention(MegatronModule, ABC):
                         attn_mask_type=attn_mask_type,
                         attention_bias=attention_bias,
                         packed_seq_params=packed_seq_params,
+                        **core_attention_extra_kwargs,
                     )
 
             else:

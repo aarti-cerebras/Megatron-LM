@@ -6,6 +6,7 @@ from typing import List, Optional
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNet2, GatedDeltaNetSubmodules
+from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
@@ -146,6 +147,50 @@ def get_dsa_module_spec_for_backend(
     return attention
 
 
+def get_dsa_gqa_module_spec_for_backend(
+    config: TransformerConfig, backend: BackendSpecProvider = None
+) -> ModuleSpec:
+    """Build standard GQA with a DSA indexer and dense Phase-1 attention delegate."""
+    if backend is None:
+        backend = _get_backend_spec_provider(config=config)
+
+    indexer = ModuleSpec(
+        module=DSAIndexer,
+        submodules=DSAIndexerSubmodules(
+            linear_wq_b=backend.linear(),
+            linear_wk=backend.linear(),
+            k_norm=backend.layer_norm(rms_norm=False, for_qk=True),
+            linear_weights_proj=backend.linear(),
+        ),
+    )
+    core_attention = ModuleSpec(
+        module=DSAttention,
+        submodules=DSAttentionSubmodules(
+            indexer=indexer,
+            dense_attention=backend.core_attention(),
+        ),
+    )
+    qk_norm = (
+        backend.layer_norm(rms_norm=config.normalization == "RMSNorm", for_qk=True)
+        if config.qk_layernorm
+        else IdentityOp
+    )
+    return ModuleSpec(
+        module=SelfAttention,
+        params={"attn_mask_type": AttnMaskType.causal},
+        submodules=SelfAttentionSubmodules(
+            # The indexer consumes the externally normalized hidden state, so QKV must not
+            # contain a second fused input normalization.
+            linear_qkv=backend.column_parallel_linear(),
+            core_attention=core_attention,
+            linear_proj=backend.row_parallel_linear(),
+            q_layernorm=qk_norm,
+            k_layernorm=qk_norm,
+        ),
+        metainfo={"fuse_input_layernorm": False},
+    )
+
+
 def get_experimental_attention_variant_module_spec(
     config: TransformerConfig, backend: BackendSpecProvider = None
 ) -> ModuleSpec:
@@ -158,6 +203,8 @@ def get_experimental_attention_variant_module_spec(
         return get_gated_delta_net_module_spec(config=config, backend=backend)
     elif config.experimental_attention_variant == "dsa":
         return get_dsa_module_spec_for_backend(config=config, backend=backend)
+    elif config.experimental_attention_variant == "dsa_gqa":
+        return get_dsa_gqa_module_spec_for_backend(config=config, backend=backend)
     else:
         raise ValueError(
             f"Invalid experimental attention variant: {config.experimental_attention_variant}"
@@ -208,6 +255,8 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
     experimental_attention_pattern = [0] * config.num_layers
     if is_linear_attention_variant(config.experimental_attention_variant):
         experimental_attention_pattern = get_linear_attention_pattern(config=config)
+    elif config.experimental_attention_variant == "dsa_gqa":
+        experimental_attention_pattern = get_dsa_layer_pattern(config=config)
     elif config.experimental_attention_variant is not None:
         experimental_attention_pattern = [1] * config.num_layers
 
@@ -395,7 +444,7 @@ def is_linear_attention_variant(experimental_attention_variant: Optional[str]) -
 def _validate_dsa_index_share_pipeline_split(config: TransformerConfig, local_layer_ids) -> None:
     """Ensure DSA top-k sharing does not require top-k indices from another PP stage."""
     if (
-        config.experimental_attention_variant != "dsa"
+        config.experimental_attention_variant not in ("dsa", "dsa_gqa")
         or getattr(config, "dsa_indexer_topk_freq", 1) <= 1
     ):
         return
@@ -453,6 +502,25 @@ def get_moe_layer_pattern(config: TransformerConfig) -> List[int]:
             f"Invalid moe_layer_freq: {type(config.moe_layer_freq)}, {config.moe_layer_freq}"
         )
     return moe_layer_pattern
+
+
+def get_dsa_layer_pattern(config: TransformerConfig) -> List[int]:
+    """Parse ``dsa_layer_freq`` into a per-layer DSA-GQA pattern."""
+    if isinstance(config.dsa_layer_freq, int):
+        return [
+            int((layer + 1) % config.dsa_layer_freq == 0)
+            for layer in range(config.num_layers)
+        ]
+    if isinstance(config.dsa_layer_freq, list):
+        if len(config.dsa_layer_freq) != config.num_layers:
+            raise ValueError(
+                "dsa_layer_freq list length must match num_layers, got "
+                f"{len(config.dsa_layer_freq)} and {config.num_layers}."
+            )
+        return list(config.dsa_layer_freq)
+    raise ValueError(
+        f"dsa_layer_freq must be an integer or list, got {type(config.dsa_layer_freq)}."
+    )
 
 
 def get_linear_attention_pattern(config: TransformerConfig) -> List[int]:

@@ -375,6 +375,19 @@ def core_transformer_config_from_args(args, config_class=None):
     # Build config.
     config = config_class(**kw_args)
 
+    if getattr(args, 'experimental_attention_variant', None) == 'dsa_gqa':
+        if args.position_embedding_type not in ('rope', 'yarn'):
+            raise ValueError(
+                "dsa_gqa requires --position-embedding-type=rope or yarn, got "
+                f"{args.position_embedding_type!r}."
+            )
+        if config.dsa_indexer_rope_type is None:
+            config.dsa_indexer_rope_type = args.position_embedding_type
+        if config.dsa_indexer_rotary_base is None:
+            config.dsa_indexer_rotary_base = args.rotary_base
+        if config.dsa_indexer_rotary_percent is None:
+            config.dsa_indexer_rotary_percent = args.rotary_percent
+
     _apply_yarn_config_from_args(config, args)
 
     # Return config.

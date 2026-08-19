@@ -291,10 +291,10 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # attention variant
     ####################
-    experimental_attention_variant: Optional[Literal['gdn', 'gdn2', 'dsa', 'gated_delta_net']] = (
-        None
-    )
-    """Type of attention variant to use. Currently support gdn, gdn2 and dsa.
+    experimental_attention_variant: Optional[
+        Literal['gdn', 'gdn2', 'dsa', 'dsa_gqa', 'gated_delta_net']
+    ] = None
+    """Type of attention variant to use. Currently supports gdn, gdn2, dsa, and dsa_gqa.
     gdn2 selects the GDN2 (Gated DeltaNet-2) variant of the gated delta net layer, with
     channel-wise decay, erase and write gates; it requires flash-linear-attention >= 0.5.1.
     Both gdn and gdn2 also select the layer built for the hybrid layer pattern symbol 'G'.
@@ -338,6 +338,15 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_rope_interleaved: bool = False
     """Whether DSA indexer RoPE should use MLA-style interleaving."""
 
+    dsa_indexer_rope_type: Optional[Literal["rope", "yarn"]] = None
+    """Indexer RoPE type. DSA-GQA derives this from the model position embedding when unset."""
+
+    dsa_indexer_rotary_base: Optional[float] = None
+    """Indexer rotary base. DSA-GQA derives this from the model rotary base when unset."""
+
+    dsa_indexer_rotary_percent: Optional[float] = None
+    """Indexer rotary fraction. DSA-GQA derives this from the model rotary fraction when unset."""
+
     dsa_indexer_rotate_activation: bool = True
     """Whether DSA indexer should apply Hadamard rotate_activation to q/k before scoring."""
 
@@ -349,6 +358,16 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_k_norm_fp32: bool = False
     """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
+
+    dsa_layer_freq: Optional[Union[int, List[int]]] = None
+    """Layers that use DSA-GQA. An integer N selects every Nth (1-indexed) layer; a list uses
+    1 for DSA-GQA and 0 for standard attention."""
+
+    dsa_dense_warmup: bool = False
+    """Run stock dense attention while training the DSA indexer as a side channel."""
+
+    dsa_freeze_base: bool = False
+    """Freeze all parameters except DSA indexers before distributed wrapping."""
 
     ####################
     # linear attention
@@ -1426,9 +1445,9 @@ class TransformerConfig(ModelParallelConfig):
                 f"{self.linear_num_value_heads=} must be a multiple of "
                 f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
             )
-        elif self.experimental_attention_variant == "dsa":
+        elif self.experimental_attention_variant in ("dsa", "dsa_gqa"):
             _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
-            if self.add_bias_linear:
+            if self.experimental_attention_variant == "dsa" and self.add_bias_linear:
                 raise ValueError(
                     "DSA uses AbsorbedMLASelfAttention, which requires add_bias_linear=False. "
                     "Disable linear bias for DSA configs."
@@ -1442,6 +1461,86 @@ class TransformerConfig(ModelParallelConfig):
                     "dsa_indexer_skip_topk_offset must be non-negative, got "
                     f"{self.dsa_indexer_skip_topk_offset}."
                 )
+
+            if self.experimental_attention_variant == "dsa_gqa":
+                if self.dsa_indexer_rope_type not in (None, "rope", "yarn"):
+                    raise ValueError(
+                        "dsa_gqa supports dsa_indexer_rope_type='rope' or 'yarn', got "
+                        f"{self.dsa_indexer_rope_type!r}."
+                    )
+                if self.num_attention_heads % self.num_query_groups != 0:
+                    raise ValueError(
+                        "dsa_gqa requires num_attention_heads to be divisible by "
+                        f"num_query_groups, got {self.num_attention_heads} and "
+                        f"{self.num_query_groups}."
+                    )
+                if self.dsa_layer_freq is None:
+                    raise ValueError("dsa_gqa requires dsa_layer_freq.")
+                if self.dsa_indexer_topk_freq != 1:
+                    raise ValueError("dsa_gqa v1 requires dsa_indexer_topk_freq=1.")
+                if self.dsa_kernel_backend != "none":
+                    raise ValueError("dsa_gqa v1 requires dsa_kernel_backend='none'.")
+                if self.transformer_impl != "transformer_engine":
+                    raise ValueError("dsa_gqa requires transformer_impl='transformer_engine'.")
+                if self.softmax_type != "vanilla" and not is_te_min_version("2.8.0"):
+                    raise ValueError(
+                        "dsa_gqa learnable softmax requires Transformer Engine >= 2.8.0."
+                    )
+                if self.dsa_dense_warmup and self.dsa_indexer_use_sparse_loss:
+                    raise ValueError(
+                        "dsa_dense_warmup requires dsa_indexer_use_sparse_loss=False."
+                    )
+                if self.dsa_dense_warmup and not self.dsa_freeze_base:
+                    raise ValueError("dsa_dense_warmup requires dsa_freeze_base=True.")
+                if self.dsa_freeze_base and not self.dsa_dense_warmup:
+                    raise ValueError("dsa_freeze_base is only supported with dsa_dense_warmup.")
+                if self.dsa_freeze_base and not (self.dsa_indexer_loss_coeff or 0.0) > 0:
+                    raise ValueError("dsa_freeze_base requires dsa_indexer_loss_coeff > 0.")
+
+                if isinstance(self.dsa_layer_freq, int):
+                    if self.dsa_layer_freq < 1:
+                        raise ValueError("dsa_layer_freq must be positive.")
+                    dsa_pattern = [
+                        int((layer + 1) % self.dsa_layer_freq == 0)
+                        for layer in range(self.num_layers)
+                    ]
+                elif isinstance(self.dsa_layer_freq, list):
+                    if len(self.dsa_layer_freq) != self.num_layers:
+                        raise ValueError(
+                            "dsa_layer_freq list length must match num_layers, got "
+                            f"{len(self.dsa_layer_freq)} and {self.num_layers}."
+                        )
+                    if any(value not in (0, 1) for value in self.dsa_layer_freq):
+                        raise ValueError("dsa_layer_freq list values must be 0 or 1.")
+                    dsa_pattern = self.dsa_layer_freq
+                else:
+                    raise ValueError(
+                        "dsa_layer_freq must be an integer or list, got "
+                        f"{type(self.dsa_layer_freq)}."
+                    )
+                if not any(dsa_pattern):
+                    raise ValueError("dsa_layer_freq must select at least one layer.")
+
+                from megatron.core.transformer.utils import is_layer_window_attention
+
+                overlapping_layers = [
+                    layer + 1
+                    for layer, use_dsa in enumerate(dsa_pattern)
+                    if use_dsa
+                    and is_layer_window_attention(
+                        self.window_size, self.window_attn_skip_freq, layer + 1
+                    )
+                ]
+                if overlapping_layers:
+                    raise ValueError(
+                        "dsa_gqa layers must be full-attention layers, but these layers also use "
+                        f"sliding-window attention: {overlapping_layers}."
+                    )
+        elif self.dsa_layer_freq is not None or self.dsa_dense_warmup or self.dsa_freeze_base:
+            raise ValueError(
+                "dsa_layer_freq, dsa_dense_warmup, and dsa_freeze_base require "
+                "experimental_attention_variant='dsa_gqa'."
+            )
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling
@@ -2936,7 +3035,7 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.add_qkv_bias
             assert not self.use_kitchen
 
-        if self.experimental_attention_variant == "dsa":
+        if self.experimental_attention_variant in ("dsa", "dsa_gqa"):
             assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
             if self.context_parallel_size > 1:
                 cp_comm_types = (

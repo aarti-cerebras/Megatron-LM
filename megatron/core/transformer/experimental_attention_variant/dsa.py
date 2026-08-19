@@ -26,6 +26,7 @@ from megatron.core.transformer.experimental_attention_variant import (
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.typed_torch import apply_module
 from megatron.core.utils import get_pg_size
 
 try:
@@ -381,6 +382,36 @@ class DSAIndexerLossLoggingHelper:
         DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
 
 
+def _compute_grouped_attention_scores(
+    query: torch.Tensor, key: torch.Tensor, softmax_scale: float
+) -> torch.Tensor:
+    """Compute per-query-head scores without expanding GQA keys to query-head count."""
+    query, _ = dsa_layout.ensure_sbhd(query, "query")
+    key, _ = dsa_layout.ensure_sbhd(key, "key")
+    sq, b, num_query_heads, head_dim = query.shape
+    sk, key_batch, num_kv_heads, key_head_dim = key.shape
+    if key_batch != b or key_head_dim != head_dim:
+        raise ValueError(
+            "DSA teacher query/key shapes are incompatible: "
+            f"query={tuple(query.shape)}, key={tuple(key.shape)}."
+        )
+    if num_query_heads % num_kv_heads != 0:
+        raise ValueError(
+            "DSA teacher requires query heads to be divisible by KV heads, got "
+            f"{num_query_heads} and {num_kv_heads}."
+        )
+
+    groups_per_kv = num_query_heads // num_kv_heads
+    query_grouped = query.permute(1, 2, 0, 3).reshape(
+        b, num_kv_heads, groups_per_kv, sq, head_dim
+    )
+    key_grouped = key.permute(1, 2, 3, 0)
+    scores = torch.einsum(
+        "bngqd,bndk->bngqk", query_grouped.float(), key_grouped.float()
+    )
+    return scores.reshape(b, num_query_heads, sq, sk) * softmax_scale
+
+
 def compute_dsa_indexer_loss(
     index_scores: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -443,14 +474,7 @@ def compute_dsa_indexer_loss(
         device=index_scores.device,
     )
 
-    # [sq, b, np, hn] -> [b, np, sq, hn] -> [b * np, sq, hn]
-    query = query.permute(1, 2, 0, 3).reshape(b * np, sq, hn)
-    # [sk, b, np, hn] -> [b, np, hn, sk] -> [b * np, hn, sk]
-    key = key.permute(1, 2, 3, 0).reshape(b * np, hn, sk)
-    # Compute attention scores [b * np, sq, sk]
-    attention_scores = torch.bmm(query.float(), key.float()) * softmax_scale
-    # Reshape to [b, np, sq, sk]
-    attention_scores = attention_scores.reshape(b, np, sq, sk)
+    attention_scores = _compute_grouped_attention_scores(query, key, softmax_scale)
     if varlen_starts is not None:
         attention_scores = dsa_masking.apply_starts_ends_mask_to_scores(
             attention_scores, varlen_starts, varlen_ends, key_positions
@@ -693,17 +717,7 @@ def bwd_fused_indexer_loss_naive(
         query_valid_rows, b=b, sq=sq, device=query.device
     )
 
-    # [sq, b, np, hn] -> [b, np, sq, hn] -> [b * np, sq, hn]
-    query_reshaped = query.permute(1, 2, 0, 3).reshape(b * np, sq, hn)
-    # [sk, b, np, hn] -> [b, np, hn, sk] -> [b * np, hn, sk]
-    key_reshaped = key.permute(1, 2, 3, 0).reshape(b * np, hn, sk)
-    # Compute attention scores [b * np, sq, sk]
-    attention_scores = torch.bmm(query_reshaped.float(), key_reshaped.float()) * softmax_scale
-    # Free reshaped tensors - no longer needed after bmm
-    del query_reshaped, key_reshaped
-
-    # Reshape to [b, np, sq, sk]
-    attention_scores = attention_scores.reshape(b, np, sq, sk)
+    attention_scores = _compute_grouped_attention_scores(query, key, softmax_scale)
     varlen_starts, varlen_ends, key_positions = dsa_masking.normalize_varlen_bounds(
         mask=mask,
         varlen_starts=varlen_starts,
@@ -1082,9 +1096,11 @@ class DSAttentionSubmodules:
 
     Args:
         indexer: DSA Indexer module for computing sparse attention indices.
+        dense_attention: Optional dense attention delegate used during Phase-1 warmup.
     """
 
     indexer: Union[ModuleSpec, type] = None
+    dense_attention: Union[ModuleSpec, type] = None
 
 
 class DSAIndexer(MegatronModule):
@@ -1113,16 +1129,28 @@ class DSAIndexer(MegatronModule):
         """
         super().__init__(config=config)
         self.hidden_size = self.config.hidden_size
-        self.qk_pos_emb_head_dim = self.config.qk_pos_emb_head_dim
-        self.q_lora_rank = (
-            self.config.q_lora_rank
-            if self.config.q_lora_rank is not None
-            else self.config.hidden_size
-        )
-
         self.index_n_heads = self.config.dsa_indexer_n_heads
         self.index_head_dim = self.config.dsa_indexer_head_dim
         self.index_topk = self.config.dsa_indexer_topk
+        self.qk_pos_emb_head_dim = (
+            getattr(self.config, "qk_pos_emb_head_dim", None) or self.index_head_dim
+        )
+        self.q_lora_rank = getattr(self.config, "q_lora_rank", None) or self.config.hidden_size
+        self.rope_type = (
+            getattr(self.config, "rope_type", None)
+            or self.config.dsa_indexer_rope_type
+            or "rope"
+        )
+        self.rotary_base = (
+            getattr(self.config, "rotary_base", None)
+            or self.config.dsa_indexer_rotary_base
+            or 10000
+        )
+        self.rotary_percent = (
+            getattr(self.config, "rotary_percent", None)
+            or self.config.dsa_indexer_rotary_percent
+            or 1.0
+        )
 
         self.softmax_scale: float = self.index_head_dim**-0.5
 
@@ -1131,28 +1159,47 @@ class DSAIndexer(MegatronModule):
         self.pg_collection = pg_collection
 
         # Initialize Position Embedding.
-        if self.config.rope_type == 'rope':
+        if self.rope_type == 'rope':
             self.rotary_pos_emb = RotaryEmbedding(
                 self.qk_pos_emb_head_dim,
-                rotary_percent=self.config.rotary_percent,
-                rotary_base=self.config.rotary_base,
+                rotary_percent=self.rotary_percent,
+                rotary_base=self.rotary_base,
                 cp_group=self.pg_collection.cp,
             )
-        elif self.config.rope_type == 'yarn':
+        elif self.rope_type == 'yarn':
             self.rotary_pos_emb = YarnRotaryEmbedding(
                 self.qk_pos_emb_head_dim,
-                rotary_base=self.config.rotary_base,
-                scaling_factor=self.config.rotary_scaling_factor,
-                original_max_position_embeddings=self.config.original_max_position_embeddings,
-                beta_fast=self.config.beta_fast,
-                beta_slow=self.config.beta_slow,
-                mscale=self.config.mscale,
-                mscale_all_dim=self.config.mscale_all_dim,
+                rotary_percent=self.rotary_percent,
+                rotary_base=self.rotary_base,
+                scaling_factor=getattr(
+                    self.config,
+                    "rotary_scaling_factor",
+                    getattr(self.config, "yarn_rotary_scaling_factor", 1.0),
+                ),
+                original_max_position_embeddings=getattr(
+                    self.config,
+                    "original_max_position_embeddings",
+                    getattr(self.config, "yarn_original_max_position_embeddings", 4096),
+                ),
+                beta_fast=getattr(
+                    self.config, "beta_fast", getattr(self.config, "yarn_beta_fast", 32.0)
+                ),
+                beta_slow=getattr(
+                    self.config, "beta_slow", getattr(self.config, "yarn_beta_slow", 1.0)
+                ),
+                mscale=getattr(
+                    self.config, "mscale", getattr(self.config, "yarn_mscale", 1.0)
+                ),
+                mscale_all_dim=getattr(
+                    self.config,
+                    "mscale_all_dim",
+                    getattr(self.config, "yarn_mscale_all_dim", 0.0),
+                ),
                 cp_group=self.pg_collection.cp,
             )
         else:
             raise ValueError(
-                f'Unsupported RoPE type: {self.config.rope_type}, supported types are "rope" and '
+                f'Unsupported RoPE type: {self.rope_type}, supported types are "rope" and '
                 f'"yarn"'
             )
 
@@ -1257,7 +1304,7 @@ class DSAIndexer(MegatronModule):
         rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
             None, None, x, self.config, packed_seq_params
         )
-        if self.config.rope_type == "rope":
+        if self.rope_type == "rope":
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
             mscale = 1.0
         else:
@@ -1271,8 +1318,12 @@ class DSAIndexer(MegatronModule):
         # Gather inputs if sp is enabled
         # =========================================
         if self.config.sequence_parallel and self.pg_collection.tp.size() > 1:
-            x = gather_from_sequence_parallel_region(x, group=self.pg_collection.tp)
-            qr = gather_from_sequence_parallel_region(qr, group=self.pg_collection.tp)
+            if x is qr:
+                x = gather_from_sequence_parallel_region(x, group=self.pg_collection.tp)
+                qr = x
+            else:
+                x = gather_from_sequence_parallel_region(x, group=self.pg_collection.tp)
+                qr = gather_from_sequence_parallel_region(qr, group=self.pg_collection.tp)
 
         # =========================================
         # Get sequence length and batch size
@@ -1589,6 +1640,21 @@ class DSAttention(MegatronModule):
             )
         self.softmax_scale = softmax_scale
         self.cp_comm_type = dsa_layout.normalize_cp_comm_type(cp_comm_type)
+        self.dense_attention = None
+        if submodules.dense_attention is not None:
+            self.dense_attention = build_module(
+                submodules.dense_attention,
+                config=self.config,
+                layer_number=layer_number,
+                attn_mask_type=attn_mask_type,
+                attention_type=attention_type,
+                attention_dropout=attention_dropout,
+                softmax_scale=softmax_scale,
+                k_channels=k_channels,
+                v_channels=v_channels,
+                cp_comm_type=cp_comm_type,
+                pg_collection=self.pg_collection,
+            )
 
     def _get_index_share_carrier(
         self, packed_seq_params: Optional[PackedSeqParams], attention_mask: Optional[torch.Tensor]
@@ -1656,6 +1722,24 @@ class DSAttention(MegatronModule):
         Returns:
             output: Output tensor [sq, b, hidden_size]
         """
+        dense_output = None
+        if getattr(self.config, "dsa_dense_warmup", False):
+            if self.dense_attention is None:
+                raise RuntimeError("dsa_dense_warmup requires a dense_attention submodule.")
+            if value is None:
+                raise RuntimeError("dsa_dense_warmup requires explicit GQA values.")
+            # Delegate before DSA converts layouts or gathers TP/CP keys. TE owns those
+            # transformations and must receive the exact stock attention inputs.
+            dense_output = apply_module(self.dense_attention)(
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type=attn_mask_type,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+            )
+
         query, _ = dsa_layout.ensure_sbhd(query, "query")
         key, _ = dsa_layout.ensure_sbhd(key, "key")
         if value is not None:
@@ -2220,21 +2304,24 @@ class DSAttention(MegatronModule):
         # ===================================
         # Run sparse attention kernel
         # ===================================
-        output = _run_sparse_attention(
-            absorbed_mla=absorbed_mla,
-            query=query,
-            key=key,
-            value=value,
-            up_v_weight=up_v_weight,
-            topk_indices=topk_indices,
-            topk_length=topk_length,
-            softmax_scale=self.softmax_scale,
-            config=self.config,
-            mask=float_mask,
-            varlen_starts=varlen_starts,
-            varlen_ends=varlen_ends,
-            key_positions=key_positions,
-        )
+        if dense_output is not None:
+            output = dense_output
+        else:
+            output = _run_sparse_attention(
+                absorbed_mla=absorbed_mla,
+                query=query,
+                key=key,
+                value=value,
+                up_v_weight=up_v_weight,
+                topk_indices=topk_indices,
+                topk_length=topk_length,
+                softmax_scale=self.softmax_scale,
+                config=self.config,
+                mask=float_mask,
+                varlen_starts=varlen_starts,
+                varlen_ends=varlen_ends,
+                key_positions=key_positions,
+            )
 
         if use_indexer_loss:
             if indexer_loss is None:

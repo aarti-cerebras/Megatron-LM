@@ -2253,6 +2253,7 @@ def _add_network_size_args(parser):
         "no_rope_freq",
         "moe_layer_freq",
         "linear_attention_freq",
+        "dsa_layer_freq",
         "moe_router_load_balancing_type",
         "moe_aux_loss_coeff",
         "cp_comm_type",
@@ -3493,6 +3494,13 @@ def _add_experimental_attention_variant_args(parser):
                             'where 1 indicates an LA layer and 0 indicates a SDPA layer. '
                             'Examples: "([0]+[1]*23)": 1 SDPA layer followed by 23 LA layers, '
                             '"([1]*3+[0]*2)*2": Three LA layers followed by two SDPA layers, repeated twice.')
+    group.add_argument(
+        '--dsa-layer-freq',
+        type=moe_freq_type,
+        default=None,
+        help='DSA-GQA layer pattern. An integer N selects every Nth layer; a list uses 1 for '
+        'DSA-GQA and 0 for standard attention.',
+    )
     return parser
 
 def _add_heterogeneous_args(parser):

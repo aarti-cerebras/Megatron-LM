@@ -1791,6 +1791,26 @@ def _freeze_all_model_chunks(model_list):
     return model_list
 
 
+def _freeze_base_for_dsa(model_list):
+    """Freeze the backbone while leaving DSA indexer parameters trainable."""
+    from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexer
+
+    num_indexer_parameters = 0
+    for model_module in model_list:
+        model_module.requires_grad_(False)
+        for module in model_module.modules():
+            if hasattr(module, "frozen_expert_bias"):
+                module.frozen_expert_bias = True
+            if isinstance(module, DSAIndexer):
+                module.requires_grad_(True)
+                num_indexer_parameters += sum(
+                    parameter.numel() for parameter in module.parameters()
+                )
+    if num_indexer_parameters == 0:
+        raise RuntimeError("dsa_freeze_base did not find any DSAIndexer parameters.")
+    return model_list
+
+
 def _forward_backward_grad_context(args):
     """Grad context for a train step's forward/backward pass.
 
@@ -1879,6 +1899,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # For rare operations like post-training logits saving
     if args.freeze_all_layers:
         _freeze_all_model_chunks(model)
+    elif getattr(args, "dsa_freeze_base", False):
+        _freeze_base_for_dsa(model)
 
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
@@ -2153,6 +2175,8 @@ def setup_model_and_optimizer(
             # and skips grad-buffer allocation for all params (matching get_model behavior).
             if args.freeze_all_layers:
                 model_config.pre_wrap_hooks.append(_freeze_all_model_chunks)
+            elif getattr(args, "dsa_freeze_base", False):
+                model_config.pre_wrap_hooks.append(_freeze_base_for_dsa)
 
             return builder.build_distributed_models(
                 pg_collection=pg_collection,
