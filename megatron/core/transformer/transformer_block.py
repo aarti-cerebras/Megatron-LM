@@ -780,7 +780,34 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             layer_sharded_state_dict = layer.sharded_state_dict(
                 state_dict_prefix, sharded_pp_offset, metadata
             )
-            replace_prefix_for_sharding(layer_sharded_state_dict, state_dict_prefix, sharded_prefix)
+            non_homogeneous_prefixes = getattr(
+                getattr(layer, 'submodules_config', None),
+                'sharded_state_dict_non_homogeneous_prefixes',
+                (),
+            )
+            if non_homogeneous_prefixes and not non_homogeneous_layers:
+                # Most tensors in a mixed layer stack retain the compact layer-axis checkpoint
+                # layout. State that exists only on one layer type needs a global per-layer key;
+                # otherwise its prepended layer axis contains holes and fails integrity checks.
+                ungrouped_state_dict = layer.sharded_state_dict(state_dict_prefix, (), metadata)
+                selected_state_dict = {}
+                for state_key in tuple(layer_sharded_state_dict):
+                    local_key = state_key[len(state_dict_prefix) :]
+                    if any(local_key.startswith(item) for item in non_homogeneous_prefixes):
+                        selected_state_dict[state_key] = ungrouped_state_dict[state_key]
+                        del layer_sharded_state_dict[state_key]
+
+                replace_prefix_for_sharding(
+                    layer_sharded_state_dict, state_dict_prefix, sharded_prefix
+                )
+                replace_prefix_for_sharding(
+                    selected_state_dict, state_dict_prefix, f'{layer_prefix}{global_layer_offset}.'
+                )
+                layer_sharded_state_dict.update(selected_state_dict)
+            else:
+                replace_prefix_for_sharding(
+                    layer_sharded_state_dict, state_dict_prefix, sharded_prefix
+                )
 
             sharded_state_dict.update(layer_sharded_state_dict)
 

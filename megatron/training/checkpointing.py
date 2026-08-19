@@ -1855,6 +1855,55 @@ def _load_non_persistent_base_checkpoint(
         )
 
 
+def _is_dsa_indexer_checkpoint_key(key: str) -> bool:
+    """Return whether a checkpoint key belongs to a newly initialized DSA indexer."""
+    return ".self_attention.core_attention.indexer." in f".{key}"
+
+
+def _validate_dsa_phase1_checkpoint_mismatch(
+    absent_model_keys, unused_checkpoint_keys, checkpoint_kind: str
+) -> None:
+    """Allow a dense checkpoint to omit only DSA indexer state during Phase-1 warmup."""
+
+    def is_compatible_extra_state(key):
+        # Transformer Engine has added and removed non-parameter extra-state entries across
+        # releases. They are the reason the legacy loader already has a non-strict fallback.
+        return key.endswith("_extra_state")
+
+    invalid_absent = sorted(
+        key
+        for key in absent_model_keys
+        if not _is_dsa_indexer_checkpoint_key(key) and not is_compatible_extra_state(key)
+    )
+    invalid_unused = sorted(
+        key for key in unused_checkpoint_keys if not is_compatible_extra_state(key)
+    )
+    newly_initialized_indexer_keys = sorted(
+        key for key in absent_model_keys if _is_dsa_indexer_checkpoint_key(key)
+    )
+    if not invalid_absent and not invalid_unused:
+        if checkpoint_kind == "model state dict" and newly_initialized_indexer_keys:
+            print_rank_0(
+                "DSA Phase-1 newly initialized indexer keys: "
+                f"{newly_initialized_indexer_keys}"
+            )
+        return
+
+    def summarize(keys):
+        limit = 20
+        displayed = keys[:limit]
+        if len(keys) > limit:
+            displayed.append(f"... and {len(keys) - limit} more")
+        return displayed
+
+    raise RuntimeError(
+        "DSA Phase-1 refused to freeze a partially loaded backbone from "
+        f"{checkpoint_kind}. Only new DSA indexer keys may be absent. "
+        f"Absent model keys: {summarize(invalid_absent)}; "
+        f"unused checkpoint keys: {summarize(invalid_unused)}"
+    )
+
+
 def _load_global_dist_base_checkpoint(
     load_dir,
     args,
@@ -1912,14 +1961,25 @@ def _load_global_dist_base_checkpoint(
         )
     if checkpointing_context is not None:
         checkpointing_context['load_strategy'] = load_strategy
-    state_dict = dist_checkpointing.load(
+    validate_dsa_phase1 = getattr(args, "dsa_freeze_base", False)
+    # Check every tensor requested by the Phase-1 model, while allowing unrelated checkpoint
+    # sections (for example optimizer state under --finetune --no-load-optim) to remain unused.
+    strict = "return_unexpected" if validate_dsa_phase1 else args.dist_ckpt_strictness
+    load_result = dist_checkpointing.load(
         sharded_state_dict,
         checkpoint_name,
         load_strategy,
         validate_access_integrity=args.ckpt_load_validate_sharding_integrity,
-        strict=args.dist_ckpt_strictness,
+        strict=strict,
         verify_integrity=args.verify_integrity,
     )
+    if validate_dsa_phase1:
+        state_dict, unused_checkpoint_keys, absent_model_keys = load_result
+        _validate_dsa_phase1_checkpoint_mismatch(
+            absent_model_keys, unused_checkpoint_keys, "distributed checkpoint"
+        )
+    else:
+        state_dict = load_result
     return state_dict, checkpoint_name, release, CheckpointType.GLOBAL
 
 
@@ -2845,6 +2905,10 @@ def load_checkpoint(
 
     def load_model_state_dict(module, state_dict, strict: bool):
         """Helper function to load state dict with fallback for missing extra states."""
+        validate_dsa_phase1 = getattr(args, "dsa_freeze_base", False)
+        # Megatron's DDP wrapper intentionally discards the IncompatibleKeys result. Loading the
+        # unwrapped module gives the Phase-1 guard the exact missing and unexpected key lists.
+        load_module = unwrap_model(module) if validate_dsa_phase1 else module
         # GTP native-FP8 weights: load_state_dict's copy_ re-quantizes into the FP8 param, which
         # TE's IsMXFP8Tensor check rejects for our subclass. Present the base FP8 class for it.
         from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
@@ -2852,20 +2916,26 @@ def load_checkpoint(
         if HAVE_GTP:
             from megatron.core.tensor_parallel.gtp_api import gtp_native_fp8_load_context
 
-            load_ctx = lambda: gtp_native_fp8_load_context(module)
+            load_ctx = lambda: gtp_native_fp8_load_context(load_module)
         else:
             from contextlib import nullcontext
 
             load_ctx = nullcontext
         try:
             with load_ctx():
-                module.load_state_dict(state_dict, strict=strict)
-        except Exception as e:
+                load_return = load_module.load_state_dict(state_dict, strict=strict)
+        except Exception:
             if strict:
                 # Fallback support for backward compatibility breaking changes in TransformerEngine
                 with load_ctx():
-                    load_return = module.load_state_dict(state_dict, strict=False)
+                    load_return = load_module.load_state_dict(state_dict, strict=False)
                 print(f'load_return: {load_return}')
+            elif validate_dsa_phase1:
+                raise
+        if validate_dsa_phase1:
+            _validate_dsa_phase1_checkpoint_mismatch(
+                load_return.missing_keys, load_return.unexpected_keys, "model state dict"
+            )
 
     # Megatron-FSDP DTensors are loaded into the model buffers in-place above.
     # Replaying the translated raw state dict through ``load_state_dict`` would

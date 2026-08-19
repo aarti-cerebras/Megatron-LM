@@ -8,6 +8,7 @@ import torch
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_dsa_gqa_module_spec_for_backend,
     get_dsa_layer_pattern,
+    get_transformer_layer_with_experimental_attention_variant_spec,
 )
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.experimental_attention_variant.dsa import (
@@ -17,6 +18,8 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     _fake_quant_fp8,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from megatron.training.checkpointing import _validate_dsa_phase1_checkpoint_mismatch
 
 
 class _FakeBackend:
@@ -34,6 +37,12 @@ class _FakeBackend:
 
     def layer_norm(self, **_kwargs):
         return torch.nn.LayerNorm
+
+    def fuse_layernorm_and_linear(self):
+        return False
+
+    def activation_func(self):
+        return None
 
 
 def _dsa_gqa_config(**overrides):
@@ -90,6 +99,97 @@ def test_dsa_gqa_phase1_spec_uses_standard_attention_and_external_norm():
     assert spec.metainfo == {"fuse_input_layernorm": False}
     assert spec.submodules.core_attention.module is DSAttention
     assert spec.submodules.core_attention.submodules.dense_attention is torch.nn.Module
+
+
+def test_dsa_gqa_layer_spec_retargets_dense_checkpoint_keys():
+    config = _dsa_gqa_config(dsa_layer_freq=1, window_size=None, window_attn_skip_freq=None)
+
+    layer_spec = get_transformer_layer_with_experimental_attention_variant_spec(
+        config, backend=_FakeBackend()
+    )[0]
+    expected = {
+        "input_layernorm.weight": "self_attention.linear_qkv.layer_norm_weight",
+        "self_attention.core_attention.dense_attention.softmax_offset": (
+            "self_attention.core_attention.softmax_offset"
+        ),
+    }
+
+    assert layer_spec.submodules.sharded_state_dict_keys_map == expected
+    assert layer_spec.submodules.load_state_dict_keys_map == expected
+    assert layer_spec.submodules.sharded_state_dict_non_homogeneous_prefixes == (
+        "input_layernorm._extra_state",
+        "self_attention.core_attention.indexer.",
+        "self_attention.core_attention.dense_attention._extra_state",
+    )
+
+
+def test_mixed_dsa_gqa_specs_keep_type_specific_extra_state_per_layer():
+    specs = get_transformer_layer_with_experimental_attention_variant_spec(
+        _dsa_gqa_config(), backend=_FakeBackend()
+    )
+
+    assert specs[0].submodules.sharded_state_dict_non_homogeneous_prefixes == (
+        "self_attention.core_attention._extra_state",
+    )
+    assert specs[1].submodules.sharded_state_dict_non_homogeneous_prefixes == (
+        "input_layernorm._extra_state",
+        "self_attention.core_attention.indexer.",
+        "self_attention.core_attention.dense_attention._extra_state",
+    )
+
+
+def test_transformer_layer_remaps_dense_checkpoint_keys_for_torch_load():
+    checkpoint_keys_map = {
+        "input_layernorm.weight": "self_attention.linear_qkv.layer_norm_weight",
+        "self_attention.core_attention.dense_attention.softmax_offset": (
+            "self_attention.core_attention.softmax_offset"
+        ),
+    }
+    module = SimpleNamespace(
+        submodules_config=TransformerLayerSubmodules(load_state_dict_keys_map=checkpoint_keys_map)
+    )
+    norm = torch.randn(8)
+    sink = torch.randn(4)
+    state_dict = {
+        "decoder.layers.1.self_attention.linear_qkv.layer_norm_weight": norm,
+        "decoder.layers.1.self_attention.core_attention.softmax_offset": sink,
+    }
+
+    TransformerLayer._remap_checkpoint_state_dict_keys(
+        module, state_dict, "decoder.layers.1.", {}, True, [], [], []
+    )
+
+    assert state_dict == {
+        "decoder.layers.1.input_layernorm.weight": norm,
+        "decoder.layers.1.self_attention.core_attention.dense_attention.softmax_offset": sink,
+    }
+
+
+def test_dsa_phase1_checkpoint_validation_allows_only_new_indexer_state():
+    _validate_dsa_phase1_checkpoint_mismatch(
+        absent_model_keys={
+            "decoder.layers.1.self_attention.core_attention.indexer.linear_wk.weight",
+            "decoder.layers.1.self_attention.linear_qkv._extra_state",
+        },
+        unused_checkpoint_keys={"decoder.layers.1.mlp.linear_fc1._extra_state"},
+        checkpoint_kind="test checkpoint",
+    )
+
+
+@pytest.mark.parametrize(
+    ("absent_model_keys", "unused_checkpoint_keys"),
+    [
+        ({"decoder.layers.1.input_layernorm.weight"}, set()),
+        (set(), {"decoder.layers.1.self_attention.core_attention.softmax_offset"}),
+    ],
+)
+def test_dsa_phase1_checkpoint_validation_rejects_backbone_mismatch(
+    absent_model_keys, unused_checkpoint_keys
+):
+    with pytest.raises(RuntimeError, match="partially loaded backbone"):
+        _validate_dsa_phase1_checkpoint_mismatch(
+            absent_model_keys, unused_checkpoint_keys, "test checkpoint"
+        )
 
 
 def test_dsa_layer_integer_pattern_selects_every_nth_layer():

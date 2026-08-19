@@ -265,6 +265,11 @@ class TransformerLayerSubmodules:
             after the MLP.
         sharded_state_dict_keys_map (Dict[str, str]): Mapping for sharded tensor keys to be applied
             in the `sharded_state_dict` method.
+        load_state_dict_keys_map (Dict[str, str]): Mapping from local module key prefixes to
+            checkpoint key prefixes. The reverse mapping is applied before ordinary PyTorch
+            state-dict loading.
+        sharded_state_dict_non_homogeneous_prefixes (tuple[str, ...]): Local state-dict prefixes
+            that exist only on selected layer types and therefore need per-layer checkpoint keys.
     """
 
     input_layernorm: LayerNormBuilder = IdentityOp
@@ -281,6 +286,12 @@ class TransformerLayerSubmodules:
 
     # Mapping for sharded tensor keys to be applied in `sharded_state_dict` method
     sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
+
+    # Mapping for checkpoint keys to be retargeted before ordinary state-dict loading.
+    load_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
+
+    # State prefixes that must not be grouped across the transformer's layer axis.
+    sharded_state_dict_non_homogeneous_prefixes: tuple[str, ...] = ()
 
 
 class BaseTransformerLayer(ABC):
@@ -306,6 +317,35 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
     output of the same size.
     """
 
+    @staticmethod
+    def _remap_checkpoint_state_dict_keys(
+        module,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Retarget checkpoint keys whose owning submodule moved within this layer."""
+        del local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        for (
+            local_key_prefix,
+            checkpoint_key_prefix,
+        ) in module.submodules_config.load_state_dict_keys_map.items():
+            source_prefix = f'{prefix}{checkpoint_key_prefix}'
+            target_prefix = f'{prefix}{local_key_prefix}'
+            for source_key in tuple(state_dict):
+                if not source_key.startswith(source_prefix):
+                    continue
+                target_key = f'{target_prefix}{source_key[len(source_prefix):]}'
+                # A native checkpoint takes precedence. Leaving the legacy source key in the
+                # input makes strict loading report an ambiguous checkpoint instead of silently
+                # choosing one value.
+                if target_key not in state_dict:
+                    state_dict[target_key] = state_dict.pop(source_key)
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -325,6 +365,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         self.submodules_config = submodules
         super().__init__(config=config, vp_stage=vp_stage)
+
+        if self.submodules_config.load_state_dict_keys_map:
+            self.register_load_state_dict_pre_hook(self._remap_checkpoint_state_dict_keys)
 
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()

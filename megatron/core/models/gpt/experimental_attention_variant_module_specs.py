@@ -296,6 +296,10 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
     rms_norm = config.normalization == "RMSNorm"
     layer_specs = []
     for layer_number in range(config.num_layers):
+        is_dsa_gqa_layer = (
+            config.experimental_attention_variant == "dsa_gqa"
+            and experimental_attention_pattern[layer_number] == 1
+        )
         attention = (
             experimental_attention_spec
             if experimental_attention_pattern[layer_number] == 1
@@ -317,6 +321,28 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
             if fuse_pre_mlp_layernorm
             else backend.layer_norm(rms_norm=rms_norm, for_qk=False)
         )
+        checkpoint_keys_map = (
+            {
+                "input_layernorm.weight": "self_attention.linear_qkv.layer_norm_weight",
+                "self_attention.core_attention.dense_attention.softmax_offset": (
+                    "self_attention.core_attention.softmax_offset"
+                ),
+            }
+            if is_dsa_gqa_layer
+            else {}
+        )
+        if is_dsa_gqa_layer:
+            non_homogeneous_state_prefixes = (
+                "input_layernorm._extra_state",
+                "self_attention.core_attention.indexer.",
+                "self_attention.core_attention.dense_attention._extra_state",
+            )
+        elif config.experimental_attention_variant == "dsa_gqa":
+            non_homogeneous_state_prefixes = (
+                "self_attention.core_attention._extra_state",
+            )
+        else:
+            non_homogeneous_state_prefixes = ()
 
         layer_specs.append(
             ModuleSpec(
@@ -328,6 +354,9 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
                     pre_mlp_layernorm=pre_mlp_layernorm,
                     mlp=not_none(mlp),
                     mlp_bda=get_bias_dropout_add,
+                    sharded_state_dict_keys_map=checkpoint_keys_map,
+                    load_state_dict_keys_map=checkpoint_keys_map,
+                    sharded_state_dict_non_homogeneous_prefixes=non_homogeneous_state_prefixes,
                 ),
             )
         )
