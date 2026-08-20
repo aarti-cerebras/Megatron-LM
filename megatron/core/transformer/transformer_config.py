@@ -1556,6 +1556,8 @@ class TransformerConfig(ModelParallelConfig):
                     raise ValueError("dsa_freeze_base is only supported with dsa_dense_warmup.")
                 if self.dsa_freeze_base and not (self.dsa_indexer_loss_coeff or 0.0) > 0:
                     raise ValueError("dsa_freeze_base requires dsa_indexer_loss_coeff > 0.")
+                if not self.dsa_dense_warmup and self.attention_dropout != 0.0:
+                    raise ValueError("dsa_gqa sparse attention v1 requires attention_dropout=0.0.")
 
                 if isinstance(self.dsa_layer_freq, int):
                     if self.dsa_layer_freq < 1:

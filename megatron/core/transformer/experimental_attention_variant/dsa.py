@@ -131,8 +131,9 @@ def _run_sparse_attention(
     varlen_ends: Optional[torch.Tensor],
     key_positions: Optional[torch.Tensor],
     topk_length: Optional[torch.Tensor] = None,
+    softmax_offset: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Run sparse attention for absorbed and non-absorbed MLA paths."""
+    """Run sparse attention for absorbed MLA or explicit-value MQA/GQA/MHA paths."""
     if absorbed_mla:
         latent_v_channels = int(getattr(config, "kv_lora_rank", 0) or 0)
         if latent_v_channels <= 0:
@@ -188,6 +189,7 @@ def _run_sparse_attention(
         varlen_starts=varlen_starts,
         varlen_ends=varlen_ends,
         key_positions=key_positions,
+        softmax_offset=softmax_offset,
     )
 
 
@@ -2171,6 +2173,7 @@ def unfused_dsa_fn(
     varlen_starts: Optional[torch.Tensor] = None,
     varlen_ends: Optional[torch.Tensor] = None,
     key_positions: Optional[torch.Tensor] = None,
+    softmax_offset: Optional[torch.Tensor] = None,
 ):
     """
     Unfused sparse attention implementation.
@@ -2197,14 +2200,26 @@ def unfused_dsa_fn(
     key_b = key.permute(1, 2, 0, 3).contiguous()
     # [skv, b, nv, hnv] -> [b, nv, skv, hnv]
     value_b = value.permute(1, 2, 0, 3).contiguous()
-    if nk == 1 and np > 1:
-        key_b = key_b.expand(b, np, skv, hn)
-    else:
-        assert nk == np, "key head count must be 1 (MQA) or match query heads"
-    if nv == 1 and np > 1:
-        value_b = value_b.expand(b, np, skv, hnv)
-    else:
-        assert nv == np, "value head count must be 1 (MQA) or match query heads"
+    if np % nk != 0:
+        raise ValueError(
+            "query head count must be divisible by key head count for grouped-query sparse "
+            f"attention, got {np} and {nk}."
+        )
+    if np % nv != 0:
+        raise ValueError(
+            "query head count must be divisible by value head count for grouped-query sparse "
+            f"attention, got {np} and {nv}."
+        )
+    query_heads_per_key = np // nk
+    query_heads_per_value = np // nv
+
+    if softmax_offset is not None:
+        softmax_offset = softmax_offset.to(device=query.device).reshape(-1)
+        if softmax_offset.numel() != np:
+            raise ValueError(
+                "softmax_offset must contain one sink logit per local query head, got "
+                f"{softmax_offset.numel()} values for {np} heads."
+            )
 
     row_mask, varlen_starts, varlen_ends, key_positions = dsa_masking.prepare_sparse_mask_context(
         mask=mask,
@@ -2229,8 +2244,17 @@ def unfused_dsa_fn(
             h_chunk = h1 - h0
             out_h0 = h0 * hnv
             out_h1 = h1 * hnv
-            k_chunk = key_b[bi, h0:h1, :, :].contiguous()  # [h_chunk, skv, hn]
-            v_chunk = value_b[bi, h0:h1, :, :].contiguous()  # [h_chunk, skv, hnv]
+            query_head_indices = torch.arange(h0, h1, device=query.device, dtype=torch.int64)
+            key_head_indices = torch.div(
+                query_head_indices, query_heads_per_key, rounding_mode="floor"
+            )
+            value_head_indices = torch.div(
+                query_head_indices, query_heads_per_value, rounding_mode="floor"
+            )
+            # Expand only the current query-head chunk. This supports MQA, GQA, and MHA without
+            # materializing full K/V tensors at query-head count.
+            k_chunk = key_b[bi].index_select(0, key_head_indices).contiguous()
+            v_chunk = value_b[bi].index_select(0, value_head_indices).contiguous()
             flat_k = k_chunk.reshape(h_chunk * skv, hn)
             flat_v = v_chunk.reshape(h_chunk * skv, hnv)
             head_offsets = (
@@ -2249,10 +2273,16 @@ def unfused_dsa_fn(
 
                 # These tensors participate in autograd; reusing cached storage can
                 # invalidate saved tensors before backward runs.
-                m = torch.full(
-                    (h_chunk, s_len), float("-inf"), dtype=torch.float32, device=query.device
-                )
-                l = torch.zeros((h_chunk, s_len), dtype=torch.float32, device=query.device)
+                if softmax_offset is None:
+                    m = torch.full(
+                        (h_chunk, s_len), float("-inf"), dtype=torch.float32, device=query.device
+                    )
+                    l = torch.zeros((h_chunk, s_len), dtype=torch.float32, device=query.device)
+                else:
+                    # Seed online softmax once with the learned sink. The sink contributes one
+                    # denominator term and a zero value vector, independent of top-K chunking.
+                    m = softmax_offset[h0:h1].float().unsqueeze(-1).expand(h_chunk, s_len)
+                    l = torch.ones((h_chunk, s_len), dtype=torch.float32, device=query.device)
                 acc = torch.zeros((h_chunk, s_len, hnv), dtype=torch.float32, device=query.device)
 
                 for t0 in range(0, idx_seq.size(-1), topk_chunk_size):
@@ -2420,6 +2450,25 @@ class DSAttention(MegatronModule):
             holder = {}
             setattr(carrier, self._LENGTH_HOLDER_ATTR, holder)
         return holder
+
+    def _get_sparse_softmax_offset(self, query: torch.Tensor) -> Optional[torch.Tensor]:
+        """Return the local per-query-head sink logits for sparse attention."""
+        if getattr(self.config, "softmax_type", "vanilla") == "vanilla":
+            return None
+        if self.dense_attention is None:
+            raise RuntimeError(
+                "Sink-aware DSA sparse attention requires a dense_attention owner for "
+                "softmax_offset."
+            )
+        softmax_offset = getattr(self.dense_attention, "softmax_offset", None)
+        if softmax_offset is not None:
+            return softmax_offset
+        if self.config.softmax_type != "off-by-one":
+            raise RuntimeError(
+                f"softmax_type={self.config.softmax_type!r} requires "
+                "dense_attention.softmax_offset."
+            )
+        return torch.zeros(query.size(2), dtype=query.dtype, device=query.device)
 
     def forward(
         self,
@@ -3047,6 +3096,7 @@ class DSAttention(MegatronModule):
         if dense_output is not None:
             output = dense_output
         else:
+            softmax_offset = self._get_sparse_softmax_offset(query)
             output = _run_sparse_attention(
                 absorbed_mla=absorbed_mla,
                 query=query,
@@ -3061,6 +3111,7 @@ class DSAttention(MegatronModule):
                 varlen_starts=varlen_starts,
                 varlen_ends=varlen_ends,
                 key_positions=key_positions,
+                softmax_offset=softmax_offset,
             )
 
         if use_indexer_loss:

@@ -420,6 +420,14 @@ def test_dsa_gqa_rejects_incoherent_dense_warmup():
         _dsa_gqa_config(dsa_freeze_base=False)
 
 
+def test_dsa_gqa_phase2_rejects_attention_dropout():
+    with pytest.raises(ValueError, match="requires attention_dropout=0.0"):
+        _dsa_gqa_config(dsa_dense_warmup=False, dsa_freeze_base=False)
+
+    config = _dsa_gqa_config(dsa_dense_warmup=False, dsa_freeze_base=False, attention_dropout=0.0)
+    assert config.attention_dropout == 0.0
+
+
 def test_dsa_gqa_rejects_nonpositive_loss_block_size():
     with pytest.raises(ValueError, match="dsa_indexer_loss_block_size must be positive"):
         _dsa_gqa_config(dsa_indexer_loss_block_size=0)
