@@ -298,6 +298,15 @@ def _fake_quant_fp8(x: torch.Tensor, use_ue8m0: bool = True) -> torch.Tensor:
     return x + (quantized - x).detach()
 
 
+_DSA_INDEXER_QUALITY_METRIC_DISPLAY_NAMES = {
+    "topk_recall": "indexer topk recall",
+    "indexer_attention_mass": "attention mass captured by indexer",
+    "teacher_topk_attention_mass": "attention mass captured by teacher top-k",
+    "topk_intersection_attention_mass": "attention mass captured by top-k intersection",
+    "attention_score_recall": "attention score recall",
+}
+
+
 class DSAIndexerLossLoggingHelper:
     """Helper class for logging sparse attention indexer training diagnostics."""
 
@@ -314,7 +323,7 @@ class DSAIndexerLossLoggingHelper:
         tracker["active_layers"] = torch.zeros(
             num_layers, dtype=torch.int32, device=torch.cuda.current_device()
         )
-        for metric_name in ("topk_recall", "attention_mass_recall"):
+        for metric_name in _DSA_INDEXER_QUALITY_METRIC_DISPLAY_NAMES:
             tracker[f"{metric_name}_sum"] = torch.zeros(
                 num_layers, device=torch.cuda.current_device()
             )
@@ -356,7 +365,7 @@ class DSAIndexerLossLoggingHelper:
         # still contribute to the active-layer denominator.
         tracker["active_layers"][layer_index] = 1
         if quality_metrics is not None:
-            for metric_name in ("topk_recall", "attention_mass_recall"):
+            for metric_name in _DSA_INDEXER_QUALITY_METRIC_DISPLAY_NAMES:
                 tracker[f"{metric_name}_sum"][layer_index] += quality_metrics[
                     f"{metric_name}_sum"
                 ].detach()
@@ -374,7 +383,7 @@ class DSAIndexerLossLoggingHelper:
             tracker["values"].zero_()
             tracker["kl_values"].zero_()
             tracker["active_layers"].zero_()
-            for metric_name in ("topk_recall", "attention_mass_recall"):
+            for metric_name in _DSA_INDEXER_QUALITY_METRIC_DISPLAY_NAMES:
                 tracker[f"{metric_name}_sum"].zero_()
                 tracker[f"{metric_name}_count"].zero_()
         tracker["reduce_group"] = None
@@ -429,11 +438,19 @@ class DSAIndexerLossLoggingHelper:
             tracker.get('reduce_group') or tracker.get('avg_group'),
             data_parallel_group,
         )
-        for metric_name in ("topk_recall", "attention_mass_recall"):
-            for group in metric_groups:
-                if group is not None:
-                    torch.distributed.all_reduce(tracker[f"{metric_name}_sum"], group=group)
-                    torch.distributed.all_reduce(tracker[f"{metric_name}_count"], group=group)
+        quality_metric_tensors = [
+            tracker[f"{metric_name}_{statistic}"]
+            for metric_name in _DSA_INDEXER_QUALITY_METRIC_DISPLAY_NAMES
+            for statistic in ("sum", "count")
+        ]
+        packed_quality_metrics = torch.stack(quality_metric_tensors)
+        for group in metric_groups:
+            if group is not None:
+                torch.distributed.all_reduce(packed_quality_metrics, group=group)
+        for metric_tensor, reduced_metric in zip(
+            quality_metric_tensors, packed_quality_metrics.unbind()
+        ):
+            metric_tensor.copy_(reduced_metric)
 
     @staticmethod
     def track_indexer_metrics(
@@ -484,7 +501,7 @@ class DSAIndexerLossLoggingHelper:
         avg_indexer_kl = indexer_kl_values.sum() / active_layer_count
 
         quality_values = {}
-        for metric_name in ("topk_recall", "attention_mass_recall"):
+        for metric_name in _DSA_INDEXER_QUALITY_METRIC_DISPLAY_NAMES:
             metric_sum = tracker[f"{metric_name}_sum"].sum()
             metric_count = tracker[f"{metric_name}_count"].sum()
             if metric_count > 0:
@@ -502,7 +519,7 @@ class DSAIndexerLossLoggingHelper:
                     "indexer loss coefficient", 0
                 ) + avg_indexer_loss.new_tensor(loss_coeff)
             for metric_name, metric_value in quality_values.items():
-                display_name = f"indexer {metric_name.replace('_', ' ')}"
+                display_name = _DSA_INDEXER_QUALITY_METRIC_DISPLAY_NAMES[metric_name]
                 total_loss_dict[display_name] = total_loss_dict.get(display_name, 0) + metric_value
 
         if writer is not None:
@@ -512,7 +529,7 @@ class DSAIndexerLossLoggingHelper:
                 writer.add_scalar("indexer loss coefficient", loss_coeff, iteration)
             for metric_name, metric_value in quality_values.items():
                 writer.add_scalar(
-                    f"indexer {metric_name.replace('_', ' ')}", metric_value, iteration
+                    _DSA_INDEXER_QUALITY_METRIC_DISPLAY_NAMES[metric_name], metric_value, iteration
                 )
             if per_layer_logging:
                 for layer_index in tracker["active_layers"].nonzero().flatten().tolist():
@@ -521,11 +538,12 @@ class DSAIndexerLossLoggingHelper:
                         indexer_kl_values[layer_index],
                         iteration,
                     )
-                    for metric_name in ("topk_recall", "attention_mass_recall"):
+                    for metric_name in _DSA_INDEXER_QUALITY_METRIC_DISPLAY_NAMES:
                         metric_count = tracker[f"{metric_name}_count"][layer_index]
                         if metric_count > 0:
                             writer.add_scalar(
-                                f"indexer {metric_name.replace('_', ' ')}/layer {layer_index + 1}",
+                                f"{_DSA_INDEXER_QUALITY_METRIC_DISPLAY_NAMES[metric_name]}"
+                                f"/layer {layer_index + 1}",
                                 tracker[f"{metric_name}_sum"][layer_index] / metric_count,
                                 iteration,
                             )
@@ -535,7 +553,7 @@ class DSAIndexerLossLoggingHelper:
                 "indexer loss": avg_indexer_loss,
                 "indexer kl": avg_indexer_kl,
                 **{
-                    f"indexer {metric_name.replace('_', ' ')}": metric_value
+                    _DSA_INDEXER_QUALITY_METRIC_DISPLAY_NAMES[metric_name]: metric_value
                     for metric_name, metric_value in quality_values.items()
                 },
             }
@@ -546,11 +564,12 @@ class DSAIndexerLossLoggingHelper:
                     wandb_metrics[f"indexer kl/layer {layer_index + 1}"] = indexer_kl_values[
                         layer_index
                     ]
-                    for metric_name in ("topk_recall", "attention_mass_recall"):
+                    for metric_name in _DSA_INDEXER_QUALITY_METRIC_DISPLAY_NAMES:
                         metric_count = tracker[f"{metric_name}_count"][layer_index]
                         if metric_count > 0:
                             wandb_metrics[
-                                f"indexer {metric_name.replace('_', ' ')}/layer {layer_index + 1}"
+                                f"{_DSA_INDEXER_QUALITY_METRIC_DISPLAY_NAMES[metric_name]}"
+                                f"/layer {layer_index + 1}"
                             ] = (tracker[f"{metric_name}_sum"][layer_index] / metric_count)
             wandb_writer.log(wandb_metrics, iteration)
 
@@ -1309,8 +1328,14 @@ def fwd_blockwise_indexer_loss(
     collect_quality_metrics = metrics_out is not None and compute_topk and not sparse_loss
     topk_recall_sum = torch.zeros((), dtype=torch.float32, device=q.device)
     topk_recall_count = torch.zeros((), dtype=torch.float32, device=q.device)
-    attention_mass_recall_sum = torch.zeros((), dtype=torch.float32, device=q.device)
-    attention_mass_recall_count = torch.zeros((), dtype=torch.float32, device=q.device)
+    indexer_attention_mass_sum = torch.zeros((), dtype=torch.float32, device=q.device)
+    indexer_attention_mass_count = torch.zeros((), dtype=torch.float32, device=q.device)
+    teacher_topk_attention_mass_sum = torch.zeros((), dtype=torch.float32, device=q.device)
+    teacher_topk_attention_mass_count = torch.zeros((), dtype=torch.float32, device=q.device)
+    topk_intersection_attention_mass_sum = torch.zeros((), dtype=torch.float32, device=q.device)
+    topk_intersection_attention_mass_count = torch.zeros((), dtype=torch.float32, device=q.device)
+    attention_score_recall_sum = torch.zeros((), dtype=torch.float32, device=q.device)
+    attention_score_recall_count = torch.zeros((), dtype=torch.float32, device=q.device)
     kl_sum = torch.zeros((), dtype=torch.float32, device=q.device)
     for q_start in range(0, sq, block_size):
         q_end = min(q_start + block_size, sq)
@@ -1395,20 +1420,36 @@ def fwd_blockwise_indexer_loss(
             teacher_topk_indices = teacher_topk_indices.masked_fill(
                 teacher_topk_scores == float("-inf"), -1
             )
-            indexer_block_topk = topk_indices[:, q_start:q_end]
             teacher_topk_valid = teacher_topk_indices >= 0
             row_valid = teacher_topk_valid.any(dim=-1)
             if query_valid_rows is not None:
                 row_valid &= query_valid_rows[:, q_start:q_end]
-            overlap = (
-                teacher_topk_indices.unsqueeze(-1) == indexer_block_topk.unsqueeze(-2)
-            ) & teacher_topk_valid.unsqueeze(-1)
-            overlap_count = overlap.any(dim=-1).sum(dim=-1).float()
+            safe_teacher_topk_indices = teacher_topk_indices.clamp_min(0)
+            teacher_topk_matched = (
+                torch.gather(indexer_support, dim=-1, index=safe_teacher_topk_indices)
+                & teacher_topk_valid
+            )
+            overlap_count = teacher_topk_matched.sum(dim=-1).float()
             teacher_count = teacher_topk_valid.sum(dim=-1).float()
+            teacher_topk_probabilities = teacher_topk_scores.masked_fill(~teacher_topk_valid, 0.0)
+            teacher_topk_mass_per_row = teacher_topk_probabilities.sum(dim=-1)
+            intersection_mass_per_row = (teacher_topk_probabilities * teacher_topk_matched).sum(
+                dim=-1
+            )
+            quality_valid_row_count = row_valid.sum()
             topk_recall_sum += (overlap_count * row_valid).sum()
             topk_recall_count += (teacher_count * row_valid).sum()
-            attention_mass_recall_sum += (attention_mass_per_row * row_valid).sum()
-            attention_mass_recall_count += row_valid.sum()
+            indexer_attention_mass_sum += (attention_mass_per_row * row_valid).sum()
+            indexer_attention_mass_count += quality_valid_row_count
+            teacher_topk_attention_mass_sum += (teacher_topk_mass_per_row * row_valid).sum()
+            teacher_topk_attention_mass_count += quality_valid_row_count
+            topk_intersection_attention_mass_sum += (intersection_mass_per_row * row_valid).sum()
+            topk_intersection_attention_mass_count += quality_valid_row_count
+            # Score-weighted recall of the teacher's optimal K-key support. This differs from
+            # indexer_attention_mass: keys selected outside teacher top-K contribute to the
+            # latter, but not to this numerator.
+            attention_score_recall_sum += (intersection_mass_per_row * row_valid).sum()
+            attention_score_recall_count += (teacher_topk_mass_per_row * row_valid).sum()
 
     valid_row_count = query_valid_rows.sum() if query_valid_rows is not None else None
     loss = dsa_indexer_loss.reduce_indexer_kl_sum(
@@ -1422,8 +1463,14 @@ def fwd_blockwise_indexer_loss(
             {
                 "topk_recall_sum": topk_recall_sum,
                 "topk_recall_count": topk_recall_count,
-                "attention_mass_recall_sum": attention_mass_recall_sum,
-                "attention_mass_recall_count": attention_mass_recall_count,
+                "indexer_attention_mass_sum": indexer_attention_mass_sum,
+                "indexer_attention_mass_count": indexer_attention_mass_count,
+                "teacher_topk_attention_mass_sum": teacher_topk_attention_mass_sum,
+                "teacher_topk_attention_mass_count": teacher_topk_attention_mass_count,
+                "topk_intersection_attention_mass_sum": topk_intersection_attention_mass_sum,
+                "topk_intersection_attention_mass_count": topk_intersection_attention_mass_count,
+                "attention_score_recall_sum": attention_score_recall_sum,
+                "attention_score_recall_count": attention_score_recall_count,
             }
         )
     return topk_indices, loss * loss_coeff

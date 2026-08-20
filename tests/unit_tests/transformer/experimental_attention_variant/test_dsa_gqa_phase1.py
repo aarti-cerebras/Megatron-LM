@@ -162,8 +162,12 @@ def test_indexer_metric_reduction_uses_explicit_process_groups(monkeypatch):
     )
 
     reduced_groups = [group for _, group, _ in calls]
-    assert reduced_groups.count(pipeline_group) == 7
-    assert reduced_groups.count(data_parallel_group) == 6
+    quality_metric_count = 5
+    assert reduced_groups.count(pipeline_group) == 4
+    assert reduced_groups.count(data_parallel_group) == 3
+    packed_reductions = [tensor for tensor, _, _ in calls if tensor.ndim == 2]
+    assert len(packed_reductions) == 2
+    assert packed_reductions[0].shape == (2 * quality_metric_count, 2)
     helper.tracker.clear()
 
 
@@ -206,15 +210,36 @@ def test_blockwise_phase1_metrics_match_explicit_teacher_reference():
     teacher_topk = teacher_probs.topk(2, dim=-1).indices
     overlap = (teacher_topk.unsqueeze(-1) == topk_indices.unsqueeze(-2)).any(dim=-1)
     expected_topk_recall = overlap.float().mean()
-    expected_mass_recall = torch.gather(teacher_probs, -1, topk_indices).sum(dim=-1).mean()
+    indexer_attention_mass = torch.gather(teacher_probs, -1, topk_indices).sum(dim=-1)
+    teacher_topk_probabilities = torch.gather(teacher_probs, -1, teacher_topk)
+    teacher_topk_attention_mass = teacher_topk_probabilities.sum(dim=-1)
+    topk_intersection_attention_mass = (teacher_topk_probabilities * overlap).sum(dim=-1)
+    expected_attention_score_recall = (
+        topk_intersection_attention_mass.sum() / teacher_topk_attention_mass.sum()
+    )
 
     torch.testing.assert_close(
         metrics["topk_recall_sum"] / metrics["topk_recall_count"], expected_topk_recall
     )
     torch.testing.assert_close(
-        metrics["attention_mass_recall_sum"] / metrics["attention_mass_recall_count"],
-        expected_mass_recall,
+        metrics["indexer_attention_mass_sum"] / metrics["indexer_attention_mass_count"],
+        indexer_attention_mass.mean(),
     )
+    torch.testing.assert_close(
+        metrics["teacher_topk_attention_mass_sum"] / metrics["teacher_topk_attention_mass_count"],
+        teacher_topk_attention_mass.mean(),
+    )
+    torch.testing.assert_close(
+        metrics["topk_intersection_attention_mass_sum"]
+        / metrics["topk_intersection_attention_mass_count"],
+        topk_intersection_attention_mass.mean(),
+    )
+    torch.testing.assert_close(
+        metrics["attention_score_recall_sum"] / metrics["attention_score_recall_count"],
+        expected_attention_score_recall,
+    )
+    assert torch.all(teacher_topk_attention_mass >= indexer_attention_mass)
+    assert torch.all(indexer_attention_mass >= topk_intersection_attention_mass)
 
 
 def test_indexer_tracker_logs_per_layer_kl_and_quality_metrics(monkeypatch):
@@ -226,8 +251,14 @@ def test_indexer_tracker_logs_per_layer_kl_and_quality_metrics(monkeypatch):
     quality_metrics = {
         "topk_recall_sum": torch.tensor(3.0),
         "topk_recall_count": torch.tensor(4.0),
-        "attention_mass_recall_sum": torch.tensor(1.5),
-        "attention_mass_recall_count": torch.tensor(2.0),
+        "indexer_attention_mass_sum": torch.tensor(1.5),
+        "indexer_attention_mass_count": torch.tensor(2.0),
+        "teacher_topk_attention_mass_sum": torch.tensor(1.8),
+        "teacher_topk_attention_mass_count": torch.tensor(2.0),
+        "topk_intersection_attention_mass_sum": torch.tensor(1.2),
+        "topk_intersection_attention_mass_count": torch.tensor(2.0),
+        "attention_score_recall_sum": torch.tensor(1.2),
+        "attention_score_recall_count": torch.tensor(1.8),
     }
     helper.save_loss_to_tracker(
         torch.tensor(2.0),
@@ -257,7 +288,19 @@ def test_indexer_tracker_logs_per_layer_kl_and_quality_metrics(monkeypatch):
 
     torch.testing.assert_close(writer.values["indexer kl/layer 2"][0], torch.tensor(4.0))
     torch.testing.assert_close(total_loss_dict["indexer topk recall"], torch.tensor(0.75))
-    torch.testing.assert_close(total_loss_dict["indexer attention mass recall"], torch.tensor(0.75))
+    torch.testing.assert_close(
+        total_loss_dict["attention mass captured by indexer"], torch.tensor(0.75)
+    )
+    torch.testing.assert_close(
+        total_loss_dict["attention mass captured by teacher top-k"], torch.tensor(0.9)
+    )
+    torch.testing.assert_close(
+        total_loss_dict["attention mass captured by top-k intersection"], torch.tensor(0.6)
+    )
+    torch.testing.assert_close(total_loss_dict["attention score recall"], torch.tensor(2.0 / 3.0))
+    torch.testing.assert_close(
+        writer.values["attention score recall/layer 2"][0], torch.tensor(2.0 / 3.0)
+    )
     assert writer.values["indexer loss coefficient"] == (0.5, 7)
 
 
