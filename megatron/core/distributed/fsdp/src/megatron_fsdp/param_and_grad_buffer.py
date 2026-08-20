@@ -3320,6 +3320,8 @@ class ParamAndGradBuffer:
                             "partition_stride",
                             "is_embedding_or_output_parameter",
                             "is_embedding_parameter",
+                            "average_gradients_across_tp_domain",
+                            "is_dsa_indexer_parameter",
                             "_tensor_parallel_mode",
                             "_megatron_fsdp_model",
                         ]:

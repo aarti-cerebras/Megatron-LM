@@ -126,6 +126,12 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
             decoupled_lr_config["min_lr"] = config.decoupled_min_lr
         config_overrides[decoupled_param_key] = decoupled_lr_config
 
+    if config.dsa_indexer_lr is not None:
+        dsa_indexer_lr_config: ParamGroupOverride = {"max_lr": config.dsa_indexer_lr}
+        if config.dsa_indexer_min_lr is not None:
+            dsa_indexer_lr_config["min_lr"] = config.dsa_indexer_min_lr
+        config_overrides[ParamKey(attr="is_dsa_indexer_parameter")] = dsa_indexer_lr_config
+
     return config_overrides
 
 
@@ -198,6 +204,7 @@ def get_mup_config_overrides(
     hidden_lr_mult = 1.0 / mup_width_mult
     base_lr = config.lr
     base_min_lr = config.min_lr
+    explicit_dsa_indexer_lr = config.dsa_indexer_lr is not None
 
     # Hidden matrix-like layers get scaled LR/eps; vector-like params keep base values.
     # Prefer the explicit parameter attribute set by LanguageModule. Fall back to
@@ -221,7 +228,12 @@ def get_mup_config_overrides(
             return False
         return is_managed_by_layer_wise_optimizer(param)
 
+    def has_explicit_dsa_indexer_lr(param: torch.nn.Parameter) -> bool:
+        return explicit_dsa_indexer_lr and getattr(param, 'is_dsa_indexer_parameter', False)
+
     def should_scale_lr_with_mup(param: torch.nn.Parameter, param_name: str) -> bool:
+        if has_explicit_dsa_indexer_lr(param):
+            return False
         if decoupled_lr_enabled and getattr(param, 'is_embedding_or_output_parameter', False):
             return False
         if is_muon_managed_matrix_parameter(param, param_name):
@@ -229,6 +241,8 @@ def get_mup_config_overrides(
         return not is_vector_like_parameter(param, param_name)
 
     def should_scale_vector_like_lr_with_mup(param: torch.nn.Parameter, param_name: str) -> bool:
+        if has_explicit_dsa_indexer_lr(param):
+            return False
         if decoupled_lr_enabled and getattr(param, 'is_embedding_or_output_parameter', False):
             return False
         return is_vector_like_parameter(param, param_name)
@@ -283,6 +297,22 @@ def get_mup_config_overrides(
         if eps_override:
             hidden_output_predicate = ParamWithNamePredicate(
                 name="mup_hidden_only_for_adam_eps", fn=should_scale_eps_with_mup
+            )
+            mup_overrides[ParamKey(with_name_predicate=hidden_output_predicate)] = eps_override
+    elif explicit_dsa_indexer_lr:
+        # Keep explicit DSA LR endpoints independent from MuP scaling while retaining MuP's
+        # Adam epsilon scaling for matrix-like indexer parameters. Separate predicates avoid
+        # combining conflicting max_lr/min_lr values on the DSA parameter group.
+        if lr_override:
+            hidden_predicate = ParamWithNamePredicate(
+                name="mup_hidden_excluding_explicit_dsa_indexer", fn=should_scale_lr_with_mup
+            )
+            mup_overrides[ParamKey(with_name_predicate=hidden_predicate)] = lr_override
+
+        if eps_override:
+            hidden_output_predicate = ParamWithNamePredicate(
+                name="mup_hidden_for_adam_eps_with_explicit_dsa_indexer",
+                fn=should_scale_eps_with_mup,
             )
             mup_overrides[ParamKey(with_name_predicate=hidden_output_predicate)] = eps_override
     else:

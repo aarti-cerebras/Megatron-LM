@@ -271,6 +271,40 @@ class TestMuPLRScaling:
             # Backward-compatible fallback for older modules without the attribute.
             assert predicate_fn(hidden_param, 'embedding.word_embeddings.weight') is False
 
+    def test_explicit_dsa_indexer_lr_takes_precedence_over_mup_lr(self):
+        """Explicit DSA LR endpoints coexist with MuP Adam epsilon scaling."""
+        optimizer_config = OptimizerConfig(
+            lr=1e-3, min_lr=1e-5, dsa_indexer_lr=2e-4, dsa_indexer_min_lr=2e-6
+        )
+        width_mult = 4.0
+        overrides = {
+            **get_standard_config_overrides(optimizer_config),
+            **get_mup_config_overrides(optimizer_config, width_mult),
+        }
+
+        indexer_param = torch.nn.Parameter(torch.zeros(10, 10))
+        indexer_param.is_dsa_indexer_parameter = True
+        indexer_matches = [
+            override
+            for param_key, override in overrides.items()
+            if param_key.matches(indexer_param, 'decoder.layer.0.indexer.weight')
+        ]
+        indexer_override = combine_param_group_overrides(indexer_matches)
+
+        assert indexer_override['max_lr'] == pytest.approx(2e-4)
+        assert indexer_override['min_lr'] == pytest.approx(2e-6)
+        assert indexer_override['eps'] == pytest.approx(optimizer_config.adam_eps / width_mult)
+
+        hidden_param = torch.nn.Parameter(torch.zeros(10, 10))
+        hidden_matches = [
+            override
+            for param_key, override in overrides.items()
+            if param_key.matches(hidden_param, 'decoder.layer.0.weight')
+        ]
+        hidden_override = combine_param_group_overrides(hidden_matches)
+        assert hidden_override['max_lr'] == pytest.approx(optimizer_config.lr / width_mult)
+        assert hidden_override['min_lr'] == pytest.approx(optimizer_config.min_lr / width_mult)
+
     def test_mup_with_decoupled_lr_scales_hidden_only_for_lr(self):
         """With decoupled_lr, MuP scales hidden params only; embedding/output stay decoupled."""
         optimizer_config = OptimizerConfig(
@@ -407,6 +441,27 @@ class TestMuPOptimizerTypeHandling:
             assert param_key.matches(bias_param, 'decoder.layer.0.bias') is True
             assert param_key.matches(embedding_param, 'embedding.word_embeddings.weight') is True
             assert param_key.matches(output_param, 'output_layer.weight') is True
+
+    def test_sgd_explicit_dsa_indexer_lr_excludes_vector_from_mup_scaling(self):
+        optimizer_config = OptimizerConfig(
+            lr=1e-3, min_lr=1e-5, dsa_indexer_lr=2e-4, dsa_indexer_min_lr=2e-6
+        )
+        overrides = {
+            **get_standard_config_overrides(optimizer_config),
+            **get_mup_config_overrides(optimizer_config, 4.0, optimizer_type='sgd'),
+        }
+        indexer_param = torch.nn.Parameter(torch.zeros(10))
+        indexer_param.is_dsa_indexer_parameter = True
+        matches = [
+            override
+            for param_key, override in overrides.items()
+            if param_key.matches(indexer_param, 'decoder.layer.0.indexer.bias')
+        ]
+
+        combined_override = combine_param_group_overrides(matches)
+
+        assert combined_override['max_lr'] == pytest.approx(2e-4)
+        assert combined_override['min_lr'] == pytest.approx(2e-6)
 
     def test_sgd_with_decoupled_lr_preserves_embedding_output_precedence(self):
         """With decoupled_lr, embedding/output keep decoupled LR under SGD MuP."""

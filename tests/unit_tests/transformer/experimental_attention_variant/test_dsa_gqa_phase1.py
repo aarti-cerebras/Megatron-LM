@@ -14,6 +14,7 @@ from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossLoggingHelper,
     DSAttention,
+    FusedDSAIndexerLoss,
     _compute_grouped_attention_scores,
     _compute_index_scores,
     _fake_quant_fp8,
@@ -96,21 +97,23 @@ def test_indexer_metric_averages_only_active_dsa_layers(monkeypatch):
     helper = DSAIndexerLossLoggingHelper
     helper.tracker.clear()
     monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
-    monkeypatch.setattr(helper, "reduce_loss_in_tracker", lambda: None)
+    monkeypatch.setattr(helper, "reduce_loss_in_tracker", lambda *args, **kwargs: None)
 
     # Two microbatches on DSA layers 2 and 4. Layer 2 has a valid zero KL and must still count.
-    helper.save_loss_to_tracker(torch.tensor(0.0), layer_number=2, num_layers=4)
-    helper.save_loss_to_tracker(torch.tensor(0.0), layer_number=2, num_layers=4)
-    helper.save_loss_to_tracker(torch.tensor(8.0), layer_number=4, num_layers=4)
-    helper.save_loss_to_tracker(torch.tensor(4.0), layer_number=4, num_layers=4)
+    helper.save_loss_to_tracker(torch.tensor(0.0), layer_number=2, num_layers=4, loss_coeff=2.0)
+    helper.save_loss_to_tracker(torch.tensor(0.0), layer_number=2, num_layers=4, loss_coeff=2.0)
+    helper.save_loss_to_tracker(torch.tensor(8.0), layer_number=4, num_layers=4, loss_coeff=2.0)
+    helper.save_loss_to_tracker(torch.tensor(4.0), layer_number=4, num_layers=4, loss_coeff=2.0)
 
     total_loss_dict = {}
     helper.track_indexer_metrics(
-        loss_scale=0.5, iteration=1, writer=None, total_loss_dict=total_loss_dict
+        loss_scale=0.5, iteration=1, writer=None, total_loss_dict=total_loss_dict, loss_coeff=2.0
     )
 
     # Microbatch means are 0 and 6 for the two active layers, hence an active-layer mean of 3.
     torch.testing.assert_close(total_loss_dict["indexer loss"], torch.tensor(3.0))
+    torch.testing.assert_close(total_loss_dict["indexer kl"], torch.tensor(1.5))
+    torch.testing.assert_close(total_loss_dict["indexer loss coefficient"], torch.tensor(2.0))
     assert helper.tracker["active_layers"].count_nonzero() == 0
 
 
@@ -119,7 +122,7 @@ def test_indexer_metric_initializes_pipeline_stage_without_dsa_layers(monkeypatc
     helper.tracker.clear()
     monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
 
-    def simulate_pipeline_reduction():
+    def simulate_pipeline_reduction(*args, **kwargs):
         helper.tracker["values"][3] = 8.0
         helper.tracker["active_layers"][3] = 1
 
@@ -127,10 +130,135 @@ def test_indexer_metric_initializes_pipeline_stage_without_dsa_layers(monkeypatc
     total_loss_dict = {}
 
     helper.track_indexer_metrics(
-        loss_scale=1.0, iteration=1, writer=None, total_loss_dict=total_loss_dict, num_layers=4
+        loss_scale=1.0,
+        iteration=1,
+        writer=None,
+        total_loss_dict=total_loss_dict,
+        num_layers=4,
+        loss_coeff=0.25,
     )
 
     torch.testing.assert_close(total_loss_dict["indexer loss"], torch.tensor(8.0))
+    torch.testing.assert_close(total_loss_dict["indexer loss coefficient"], torch.tensor(0.25))
+
+
+def test_indexer_metric_reduction_uses_explicit_process_groups(monkeypatch):
+    helper = DSAIndexerLossLoggingHelper
+    helper.tracker.clear()
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+    helper._initialize_tracker(num_layers=2)
+
+    pipeline_group = object()
+    data_parallel_group = object()
+    calls = []
+
+    def record_all_reduce(tensor, group=None, op=None):
+        calls.append((tensor, group, op))
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", record_all_reduce)
+
+    helper.reduce_loss_in_tracker(
+        pipeline_group=pipeline_group, data_parallel_group=data_parallel_group
+    )
+
+    reduced_groups = [group for _, group, _ in calls]
+    assert reduced_groups.count(pipeline_group) == 7
+    assert reduced_groups.count(data_parallel_group) == 6
+    helper.tracker.clear()
+
+
+def test_blockwise_phase1_metrics_match_explicit_teacher_reference():
+    torch.manual_seed(123)
+    sq = sk = 5
+    q = torch.randn(sq, 1, 2, 3)
+    k = torch.randn(sk, 1, 3)
+    weights = torch.randn(sq, 1, 2)
+    query = torch.randn(sq, 1, 4, 3)
+    key = torch.randn(sk, 1, 4, 3)
+    mask = torch.zeros(sq, sk)
+    metrics = {}
+    pg_collection = SimpleNamespace(tp=SimpleNamespace(size=lambda: 1))
+
+    topk_indices, _ = FusedDSAIndexerLoss.apply(
+        q,
+        weights,
+        k,
+        query,
+        key,
+        0.5,
+        2,
+        0.25,
+        mask,
+        False,
+        pg_collection,
+        None,
+        None,
+        None,
+        None,
+        False,
+        True,
+        2,
+        True,
+        metrics,
+    )
+
+    teacher_probs = _compute_grouped_attention_scores(query, key, 0.5).softmax(dim=-1).mean(dim=1)
+    teacher_topk = teacher_probs.topk(2, dim=-1).indices
+    overlap = (teacher_topk.unsqueeze(-1) == topk_indices.unsqueeze(-2)).any(dim=-1)
+    expected_topk_recall = overlap.float().mean()
+    expected_mass_recall = torch.gather(teacher_probs, -1, topk_indices).sum(dim=-1).mean()
+
+    torch.testing.assert_close(
+        metrics["topk_recall_sum"] / metrics["topk_recall_count"], expected_topk_recall
+    )
+    torch.testing.assert_close(
+        metrics["attention_mass_recall_sum"] / metrics["attention_mass_recall_count"],
+        expected_mass_recall,
+    )
+
+
+def test_indexer_tracker_logs_per_layer_kl_and_quality_metrics(monkeypatch):
+    helper = DSAIndexerLossLoggingHelper
+    helper.tracker.clear()
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(helper, "reduce_loss_in_tracker", lambda *args, **kwargs: None)
+
+    quality_metrics = {
+        "topk_recall_sum": torch.tensor(3.0),
+        "topk_recall_count": torch.tensor(4.0),
+        "attention_mass_recall_sum": torch.tensor(1.5),
+        "attention_mass_recall_count": torch.tensor(2.0),
+    }
+    helper.save_loss_to_tracker(
+        torch.tensor(2.0),
+        layer_number=2,
+        num_layers=4,
+        loss_coeff=0.5,
+        quality_metrics=quality_metrics,
+    )
+
+    class _Writer:
+        def __init__(self):
+            self.values = {}
+
+        def add_scalar(self, name, value, iteration):
+            self.values[name] = (value, iteration)
+
+    writer = _Writer()
+    total_loss_dict = {}
+    helper.track_indexer_metrics(
+        loss_scale=1.0,
+        iteration=7,
+        writer=writer,
+        total_loss_dict=total_loss_dict,
+        per_layer_logging=True,
+        loss_coeff=0.5,
+    )
+
+    torch.testing.assert_close(writer.values["indexer kl/layer 2"][0], torch.tensor(4.0))
+    torch.testing.assert_close(total_loss_dict["indexer topk recall"], torch.tensor(0.75))
+    torch.testing.assert_close(total_loss_dict["indexer attention mass recall"], torch.tensor(0.75))
+    assert writer.values["indexer loss coefficient"] == (0.5, 7)
 
 
 def test_dsa_gqa_phase1_spec_uses_standard_attention_and_external_norm():

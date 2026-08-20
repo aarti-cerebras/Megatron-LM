@@ -151,6 +151,16 @@ class OptimizerConfig:
     min_lr: Optional[float] = None
     """Minumum value for learning rate. The scheduler clip values below this threshold."""
 
+    dsa_indexer_lr: Optional[float] = None
+    """Separate maximum learning rate for DSA indexer parameters. When unset, indexer
+       parameters use ``lr``.
+    """
+
+    dsa_indexer_min_lr: Optional[float] = None
+    """Minimum learning rate for DSA indexer parameters. When unset, indexer parameters use
+       ``min_lr``.
+    """
+
     decoupled_lr: Optional[float] = None
     """Separate learning rate for the input and output layer."""
 
@@ -397,6 +407,23 @@ class OptimizerConfig:
 
     def __post_init__(self):
         """Check the validity of the config."""
+
+        if self.dsa_indexer_lr is not None and self.dsa_indexer_lr < 0.0:
+            raise ValueError("dsa_indexer_lr must be non-negative")
+        if self.dsa_indexer_min_lr is not None:
+            if self.dsa_indexer_lr is None:
+                raise ValueError("dsa_indexer_min_lr requires dsa_indexer_lr")
+            if self.dsa_indexer_min_lr < 0.0:
+                raise ValueError("dsa_indexer_min_lr must be non-negative")
+        effective_dsa_indexer_min_lr = (
+            self.dsa_indexer_min_lr if self.dsa_indexer_min_lr is not None else self.min_lr
+        )
+        if (
+            self.dsa_indexer_lr is not None
+            and effective_dsa_indexer_min_lr is not None
+            and effective_dsa_indexer_min_lr > self.dsa_indexer_lr
+        ):
+            raise ValueError("DSA indexer minimum learning rate must not exceed dsa_indexer_lr")
 
         # The following condition is used to avoid repetition in distrib_optimizer.py.
         # This is because in distrib_optimizer.py, the process to handle parameters are

@@ -8,6 +8,7 @@ import pytest
 from megatron.core.optimizer_param_scheduler import (
     OptimizerParamScheduler,
     get_canonical_lr_for_logging,
+    get_dsa_indexer_lr_for_logging,
 )
 
 
@@ -348,3 +349,20 @@ class TestGetCanonicalLrForLogging:
         """lr=0.0 is a legitimate value, not to be confused with None."""
         param_groups = [{'lr': 0.0, 'default_config': True}]
         assert get_canonical_lr_for_logging(param_groups) == 0.0
+
+
+def test_get_dsa_indexer_lr_for_logging():
+    base_param = MagicMock()
+    base_param.is_dsa_indexer_parameter = False
+    indexer_param = MagicMock()
+    indexer_param.is_dsa_indexer_parameter = True
+    param_groups = [
+        {'params': [base_param], 'lr': 1.0e-5},
+        {'params': [indexer_param], 'lr': 1.0e-4},
+    ]
+
+    assert get_dsa_indexer_lr_for_logging(param_groups) == 1.0e-4
+
+
+def test_get_dsa_indexer_lr_for_logging_returns_none_without_local_indexer_params():
+    assert get_dsa_indexer_lr_for_logging([{'params': [], 'lr': 1.0e-4}]) is None

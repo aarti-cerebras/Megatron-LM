@@ -292,6 +292,17 @@ def loss_func(
     return loss, num_tokens, report
 
 
+def _dsa_phase1_output_processor(hidden_states: torch.Tensor, **_kwargs) -> torch.Tensor:
+    """Return a zero primary loss while preserving DSA indexer-loss autograd hooks.
+
+    Phase 1 freezes the base model and uses dense attention, so the language-model loss has no
+    gradient path to the trainable indexers. Keeping a zero-valued dependency on the decoder
+    output still drives backward through ``DSAIndexerLossAutoScaler`` without materializing the
+    vocabulary projection or its full-sequence FP32 cross-entropy buffer.
+    """
+    return hidden_states[..., 0].transpose(0, 1).contiguous() * 0.0
+
+
 def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = False):
     """Forward training step.
 
@@ -348,13 +359,22 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
 
     timers('batch-generator').stop()
 
+    output_processor = None
+    if getattr(args, "dsa_freeze_base", False) and getattr(args, "dsa_dense_warmup", False):
+        output_processor = _dsa_phase1_output_processor
+
     with stimer:
         if return_schedule_plan:
             assert (
                 args.overlap_moe_expert_parallel_comm
             ), "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
             schedule_plan = model.build_schedule_plan(
-                tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
+                tokens,
+                position_ids,
+                attention_mask,
+                labels=labels,
+                loss_mask=loss_mask,
+                output_processor=output_processor,
             )
             return schedule_plan, partial(loss_func, loss_mask, model=model)
         else:
@@ -365,6 +385,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 labels=labels,
                 loss_mask=loss_mask,
                 packed_seq_params=packed_seq_params,
+                output_processor=output_processor,
             )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses

@@ -150,6 +150,7 @@ param_group_identifier_keys = (
 MTP_GRAD_NORM_GROUP = 'mtp'
 GRAD_NORM_GROUP_ATTR = 'grad_norm_group'
 SEPARATE_GRAD_NORM_GROUPS = (MTP_GRAD_NORM_GROUP,)
+DSA_INDEXER_PARAM_ATTR = 'is_dsa_indexer_parameter'
 
 
 def _get_param_grad_norm_group(param: torch.nn.Parameter) -> Optional[str]:
@@ -182,6 +183,8 @@ def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tenso
         destination.shared = source.shared
     if hasattr(source, GRAD_NORM_GROUP_ATTR):
         setattr(destination, GRAD_NORM_GROUP_ATTR, getattr(source, GRAD_NORM_GROUP_ATTR))
+    if hasattr(source, DSA_INDEXER_PARAM_ATTR):
+        setattr(destination, DSA_INDEXER_PARAM_ATTR, getattr(source, DSA_INDEXER_PARAM_ATTR))
 
 
 class MegatronOptimizer(ABC):
@@ -319,6 +322,45 @@ class MegatronOptimizer(ABC):
             cache[grad_norm_group] = bool(flag.item() > 0)
         return cache[grad_norm_group]
 
+    def has_dsa_indexer_params(self) -> bool:
+        """Whether any rank in this optimizer's grad-stats group owns DSA indexer parameters."""
+        if not hasattr(self, '_has_dsa_indexer_params_cache'):
+            local = any(
+                getattr(param, DSA_INDEXER_PARAM_ATTR, False) for param in self.get_parameters()
+            )
+            flag = torch.tensor([1 if local else 0], dtype=torch.int, device='cuda')
+            torch.distributed.all_reduce(
+                flag, op=torch.distributed.ReduceOp.MAX, group=self.get_grad_stats_parallel_group()
+            )
+            self._has_dsa_indexer_params_cache = bool(flag.item() > 0)
+        return self._has_dsa_indexer_params_cache
+
+    def get_dsa_indexer_grads_for_norm(self) -> List[torch.Tensor]:
+        """Return optimizer-ready DSA indexer gradients for diagnostic norm reporting."""
+        return self._filter_grads_for_norm(
+            self.get_parameters(),
+            param_filter=lambda param: getattr(param, DSA_INDEXER_PARAM_ATTR, False),
+        )
+
+    @torch.no_grad()
+    def _get_dsa_indexer_grad_norm(self) -> float:
+        return get_grad_norm_fp32(
+            self.get_dsa_indexer_grads_for_norm(),
+            grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
+        )
+
+    @torch.no_grad()
+    def _compute_dsa_grad_norms(self, total_grad_norm: float) -> Dict[str, float]:
+        """Split the pre-clipping main norm into DSA indexer and backbone components."""
+        self.dsa_grad_norms = {}
+        if not self.has_dsa_indexer_params():
+            return self.dsa_grad_norms
+        indexer_grad_norm = float(self._get_dsa_indexer_grad_norm())
+        total_grad_norm = float(0.0 if total_grad_norm is None else total_grad_norm)
+        base_squared = max(total_grad_norm**2 - indexer_grad_norm**2, 0.0)
+        self.dsa_grad_norms = {'indexer': indexer_grad_norm, 'base': math.sqrt(base_squared)}
+        return self.dsa_grad_norms
+
     def get_grad_stats_parallel_group(self) -> torch.distributed.ProcessGroup:
         """Process group for reducing gradient statistics (num_zeros & norm).
 
@@ -386,6 +428,8 @@ class MegatronOptimizer(ABC):
         grad_norm = get_grad_norm_fp32(
             grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
         )
+        if hasattr(self, '_compute_dsa_grad_norms'):
+            self._compute_dsa_grad_norms(grad_norm)
 
         if clip_grad > 0.0 and params:
             # Only reduce group grad norms when clipping can use them.
@@ -816,6 +860,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
     def step(self):
         timers = self.config.timers
         self.grad_norms_by_group = {}
+        self.dsa_grad_norms = {}
 
         found_inf_flag = self.prepare_grads()
         if found_inf_flag:
@@ -829,6 +874,9 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         grad_norm = 0.0
         if self.config.clip_grad > 0.0:
             grad_norm = self.clip_grad_norm(self.config.clip_grad)
+        elif self.has_dsa_indexer_params():
+            grad_norm = self.get_grad_norm()
+            self._compute_dsa_grad_norms(grad_norm)
         if timers is not None:
             timers('optimizer-clip-main-grad').stop()
 
@@ -1337,6 +1385,7 @@ class FP32Optimizer(MegatronOptimizer):
         Always return successful since there is no overflow."""
         timers = self.config.timers
         self.grad_norms_by_group = {}
+        self.dsa_grad_norms = {}
 
         found_inf_flag = self.prepare_grads()
         if found_inf_flag:
@@ -1350,6 +1399,9 @@ class FP32Optimizer(MegatronOptimizer):
         grad_norm = None
         if self.config.clip_grad > 0.0:
             grad_norm = self.clip_grad_norm(self.config.clip_grad)
+        elif self.has_dsa_indexer_params():
+            grad_norm = self.get_grad_norm()
+            self._compute_dsa_grad_norms(grad_norm)
         if timers is not None:
             timers('optimizer-clip-main-grad').stop()
 
@@ -1851,6 +1903,34 @@ class ChainedOptimizer(MegatronOptimizer):
             )
         return cache[grad_norm_group]
 
+    def has_dsa_indexer_params(self) -> bool:
+        """Whether any chained optimizer owns DSA indexer parameters."""
+        if not hasattr(self, '_has_dsa_indexer_params_cache'):
+            self._has_dsa_indexer_params_cache = any(
+                optimizer.has_dsa_indexer_params() for optimizer in self.chained_optimizers
+            )
+        return self._has_dsa_indexer_params_cache
+
+    @torch.no_grad()
+    def _get_dsa_indexer_grad_norm(self) -> float:
+        """Compute the DSA indexer norm across chained optimizer grad-stat groups."""
+        if self.grads_states_parallel_group_is_shared():
+            grouped_grads = []
+            for optimizer in self.chained_optimizers:
+                grouped_grads += optimizer.get_dsa_indexer_grads_for_norm()
+            return get_grad_norm_fp32(
+                grouped_grads, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+            )
+
+        group_norms = []
+        for optimizer in self.chained_optimizers:
+            norm = get_grad_norm_fp32(
+                optimizer.get_dsa_indexer_grads_for_norm(),
+                grad_stats_parallel_group=optimizer.get_grad_stats_parallel_group(),
+            )
+            group_norms.append(norm if norm else 0.0)
+        return math.sqrt(sum(norm**2 for norm in group_norms))
+
     @torch.no_grad()
     def _get_grad_norm_for_group(self, grad_norm_group: str):
         """Compute gradient norm for a named parameter group."""
@@ -1891,11 +1971,13 @@ class ChainedOptimizer(MegatronOptimizer):
         norm and clipped independently using their group norm.
         """
         self.grad_norms_by_group = {}
+        self.dsa_grad_norms = {}
         found_inf_flag = self.prepare_grads()
         if found_inf_flag:
             return False, None, None
 
         grad_norm = self.get_grad_norm()
+        self._compute_dsa_grad_norms(grad_norm)
         should_skip_update = False
 
         should_clip = any(

@@ -1327,6 +1327,19 @@ def validate_args(args, defaults={}):
         assert args.max_position_embeddings >= args.decoder_seq_length
     if args.lr is not None:
         assert args.min_lr <= args.lr
+    if args.dsa_indexer_lr is not None:
+        assert args.dsa_indexer_lr >= 0.0
+        if args.dsa_indexer_min_lr is not None:
+            assert args.dsa_indexer_min_lr >= 0.0
+        effective_dsa_indexer_min_lr = (
+            args.dsa_indexer_min_lr
+            if args.dsa_indexer_min_lr is not None
+            else args.min_lr
+        )
+        assert effective_dsa_indexer_min_lr <= args.dsa_indexer_lr
+    else:
+        assert args.dsa_indexer_min_lr is None, \
+            '--dsa-indexer-min-lr requires --dsa-indexer-lr'
     if args.save is not None:
         assert args.save_interval is not None
         assert args.save_interval > 0
@@ -2906,6 +2919,13 @@ def _add_learning_rate_args(parser):
     group.add_argument('--min-lr', type=float, default=0.0,
                        help='Minimum value for learning rate. The scheduler'
                        'clip values below this threshold.')
+    group.add_argument('--dsa-indexer-lr', type=float, default=None,
+                       help='Separate maximum learning rate for DSA indexer parameters. '
+                       'The base model continues to use --lr; both schedules share the '
+                       'configured warmup and decay shape.')
+    group.add_argument('--dsa-indexer-min-lr', type=float, default=None,
+                       help='Minimum learning rate for DSA indexer parameters. When omitted, '
+                       'the indexer uses --min-lr.')
     group.add_argument('--decoupled-lr', type=float, default=None,
                        help='Separate learning rate for the input and output layer')
     group.add_argument('--decoupled-min-lr', type=float, default=None,

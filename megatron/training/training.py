@@ -40,9 +40,10 @@ logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
 # measurement (kept for backwards compatibility).
 _LEGACY_TRAIN_START_TIME = time.time()  # NOTE(asolergi-nv): Legacy timestamp
 
+from megatron.core import mpu, nccl_allocator, tensor_parallel
+
 # First-party.
 from megatron.core._rank_utils import safe_get_rank
-from megatron.core import mpu, nccl_allocator, tensor_parallel
 from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
@@ -90,6 +91,7 @@ from megatron.core.optimizer.qk_clip import clip_qk
 from megatron.core.optimizer_param_scheduler import (
     OptimizerParamScheduler,
     get_canonical_lr_for_logging,
+    get_dsa_indexer_lr_for_logging,
 )
 from megatron.core.parallel_state import (
     create_all_gather_groups,
@@ -2715,6 +2717,8 @@ def training_log(
     params_norm,
     num_zeros_in_grad,
     max_attention_logit,
+    dsa_grad_norms=None,
+    dsa_indexer_learning_rate: float | None = None,
     pg_collection=None,
     is_first_iteration=False,
     seqlen_squared_sum_in_batch: float | None = None,
@@ -2813,6 +2817,9 @@ def training_log(
     learning_rate: float | None = reduce_max_stat_across_model_parallel_group(
         learning_rate, group=_lr_mp_group
     )
+    dsa_indexer_learning_rate = reduce_max_stat_across_model_parallel_group(
+        dsa_indexer_learning_rate, group=_lr_mp_group
+    )
     if learning_rate is None and args.freeze_all_layers:
         learning_rate = 0.0
     # Tensorboard values.
@@ -2824,6 +2831,17 @@ def training_log(
             writer.add_scalar('learning-rate vs samples', learning_rate, args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'learning-rate': learning_rate}, iteration)
+        if dsa_indexer_learning_rate is not None:
+            writer.add_scalar('dsa-indexer-learning-rate', dsa_indexer_learning_rate, iteration)
+            writer.add_scalar(
+                'dsa-indexer-learning-rate vs samples',
+                dsa_indexer_learning_rate,
+                args.consumed_train_samples,
+            )
+            if wandb_writer:
+                wandb_writer.log(
+                    {'dsa-indexer-learning-rate': dsa_indexer_learning_rate}, iteration
+                )
         if args.skipped_train_samples > 0:
             writer.add_scalar('skipped-train-samples', args.skipped_train_samples, iteration)
             if wandb_writer:
@@ -2859,6 +2877,15 @@ def training_log(
             writer.add_scalar('grad-norm vs samples', grad_norm, args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'grad-norm': grad_norm}, iteration)
+        if dsa_grad_norms:
+            for group_name, group_grad_norm in dsa_grad_norms.items():
+                metric_name = f'dsa-{group_name}-grad-norm'
+                writer.add_scalar(metric_name, group_grad_norm, iteration)
+                writer.add_scalar(
+                    metric_name + ' vs samples', group_grad_norm, args.consumed_train_samples
+                )
+                if wandb_writer:
+                    wandb_writer.log({metric_name: group_grad_norm}, iteration)
         if num_zeros_in_grad is not None:
             writer.add_scalar('num-zeros', num_zeros_in_grad, iteration)
             writer.add_scalar(
@@ -2948,7 +2975,11 @@ def training_log(
             writer=writer,
             wandb_writer=wandb_writer,
             total_loss_dict=total_loss_dict,
+            per_layer_logging=True,
             num_layers=args.num_layers,
+            loss_coeff=args.dsa_indexer_loss_coeff,
+            pipeline_group=pg_collection.pp if pg_collection is not None else None,
+            data_parallel_group=pg_collection.dp if pg_collection is not None else None,
         )
 
     # Dump memory snapshot and print metrics to stdout.
@@ -3011,6 +3042,8 @@ def training_log(
         # Decoupled_learning_rate should be not None only on first and last pipeline stage.
         if learning_rate is not None:
             log_string += f' learning rate: {learning_rate:.6E} |'
+        if dsa_indexer_learning_rate is not None:
+            log_string += f' dsa indexer learning rate: {dsa_indexer_learning_rate:.6E} |'
         log_string += f' global batch size: {batch_size:5d} |'
         for key in total_loss_dict:
             if key not in [advanced_iters_key, skipped_iters_key, nan_iters_key]:
@@ -3026,6 +3059,9 @@ def training_log(
         log_string += f' loss scale: {loss_scale:.1f} |'
         if grad_norm is not None:
             log_string += f' grad norm: {grad_norm:.3f} |'
+        if dsa_grad_norms:
+            log_string += f' dsa indexer grad norm: {dsa_grad_norms["indexer"]:.3f} |'
+            log_string += f' dsa base grad norm: {dsa_grad_norms["base"]:.3f} |'
         if num_zeros_in_grad is not None:
             log_string += f' num zeros: {num_zeros_in_grad} |'
         if params_norm is not None:
@@ -4121,8 +4157,10 @@ def train(
             params_norm = calc_params_l2_norm(model)
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
+            dsa_indexer_learning_rate = get_dsa_indexer_lr_for_logging(optimizer.param_groups)
         else:
             learning_rate = None
+            dsa_indexer_learning_rate = None
         report_memory_flag = training_log(
             loss_dict,
             total_loss_dict,
@@ -4135,6 +4173,8 @@ def train(
             params_norm,
             num_zeros_in_grad,
             max_attention_logit,
+            dsa_grad_norms=getattr(optimizer, 'dsa_grad_norms', None),
+            dsa_indexer_learning_rate=dsa_indexer_learning_rate,
             pg_collection=model_pg_collection,
             is_first_iteration=is_first_iteration,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,

@@ -1,6 +1,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Learning rate decay and weight decay incr functions."""
+
 import logging
 import math
 from typing import TYPE_CHECKING, Any, Optional, TypedDict
@@ -53,6 +54,29 @@ def get_canonical_lr_for_logging(param_groups: list[dict]) -> float | None:
     """
     for param_group in param_groups:
         if param_group.get('default_config', False):
+            return param_group.get('lr')
+    return None
+
+
+def get_dsa_indexer_lr_for_logging(param_groups: list[dict]) -> float | None:
+    """Return the learning rate applied to DSA indexer parameters.
+
+    A DSA indexer can span multiple optimizer groups due to weight-decay overrides, but all
+    indexer groups share the same LR schedule. Optimizer parameter copies preserve the indexer
+    tag, so this also works with mixed-precision and distributed optimizers.
+
+    Args:
+        param_groups (list[dict]): Parameter groups from the optimizer.
+
+    Returns:
+        float | None: The indexer learning rate, or ``None`` when this rank has no indexer
+        parameters. The training logger reduces this value across model-parallel ranks.
+    """
+    for param_group in param_groups:
+        if any(
+            getattr(param, 'is_dsa_indexer_parameter', False)
+            for param in param_group.get('params', [])
+        ):
             return param_group.get('lr')
     return None
 

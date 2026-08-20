@@ -748,6 +748,21 @@ class TestMegatronFsdpFullyShard:
             optimizer.step()
             optimizer.zero_grad()
 
+    def test_optimizer_parameters_preserve_dsa_attributes(self):
+        """MCore FSDP replacement parameters retain DSA optimizer and TP-sync metadata."""
+        model = RootParamModel().cuda()
+        model.weight.is_dsa_indexer_parameter = True
+        model.weight.average_gradients_across_tp_domain = True
+
+        mfsdp_model = fully_shard_model(
+            module=model, fsdp_unit_modules=[RootParamModel], zero_dp_strategy=OPTIM_GRADS_PARAMS
+        )
+        optimizer_params = dict(mfsdp_model.param_and_grad_buffer.optimizer_named_parameters)
+        replacement_weight = optimizer_params['weight']
+
+        assert replacement_weight.is_dsa_indexer_parameter is True
+        assert replacement_weight.average_gradients_across_tp_domain is True
+
     @pytest.mark.parametrize("shard_strategy", [OPTIM_GRADS, OPTIM_GRADS_PARAMS])
     @pytest.mark.parametrize("optimizer_type", ["adam", "adamw", "fused_adam"])
     def test_optimizer_loss_curve_matches_reference(self, shard_strategy, optimizer_type):

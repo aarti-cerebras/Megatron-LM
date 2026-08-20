@@ -7,7 +7,6 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from megatron.core import parallel_state
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -300,7 +299,7 @@ def _fake_quant_fp8(x: torch.Tensor, use_ue8m0: bool = True) -> torch.Tensor:
 
 
 class DSAIndexerLossLoggingHelper:
-    """Helper class for logging sparse attention indexer losses."""
+    """Helper class for logging sparse attention indexer training diagnostics."""
 
     tracker = {}
 
@@ -311,15 +310,25 @@ class DSAIndexerLossLoggingHelper:
         if "values" in tracker:
             return
         tracker["values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+        tracker["kl_values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
         tracker["active_layers"] = torch.zeros(
             num_layers, dtype=torch.int32, device=torch.cuda.current_device()
         )
+        for metric_name in ("topk_recall", "attention_mass_recall"):
+            tracker[f"{metric_name}_sum"] = torch.zeros(
+                num_layers, device=torch.cuda.current_device()
+            )
+            tracker[f"{metric_name}_count"] = torch.zeros(
+                num_layers, device=torch.cuda.current_device()
+            )
 
     @staticmethod
     def save_loss_to_tracker(
         loss: torch.Tensor,
         layer_number: int,
         num_layers: int,
+        loss_coeff: float,
+        quality_metrics: Optional[dict] = None,
         reduce_group: torch.distributed.ProcessGroup = None,
         avg_group: torch.distributed.ProcessGroup = None,
     ):
@@ -329,6 +338,8 @@ class DSAIndexerLossLoggingHelper:
             loss: The loss tensor.
             layer_number: Layer index of the loss, 1-indexed.
             num_layers: The number of total layers.
+            loss_coeff: Coefficient already applied to ``loss``.
+            quality_metrics: Optional detached numerator/denominator statistics.
             reduce_group: The group for reducing the loss.
             avg_group: The group for averaging the loss.
         """
@@ -340,9 +351,18 @@ class DSAIndexerLossLoggingHelper:
         DSAIndexerLossLoggingHelper._initialize_tracker(num_layers)
         layer_index = layer_number - 1
         tracker["values"][layer_index] += loss.detach()
+        tracker["kl_values"][layer_index] += loss.detach() / loss_coeff
         # Track participation explicitly: a valid DSA layer can have exactly zero KL and must
         # still contribute to the active-layer denominator.
         tracker["active_layers"][layer_index] = 1
+        if quality_metrics is not None:
+            for metric_name in ("topk_recall", "attention_mass_recall"):
+                tracker[f"{metric_name}_sum"][layer_index] += quality_metrics[
+                    f"{metric_name}_sum"
+                ].detach()
+                tracker[f"{metric_name}_count"][layer_index] += quality_metrics[
+                    f"{metric_name}_count"
+                ].detach()
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
 
@@ -352,41 +372,68 @@ class DSAIndexerLossLoggingHelper:
         tracker = DSAIndexerLossLoggingHelper.tracker
         if "values" in tracker:
             tracker["values"].zero_()
+            tracker["kl_values"].zero_()
             tracker["active_layers"].zero_()
+            for metric_name in ("topk_recall", "attention_mass_recall"):
+                tracker[f"{metric_name}_sum"].zero_()
+                tracker[f"{metric_name}_count"].zero_()
         tracker["reduce_group"] = None
         tracker["avg_group"] = None
 
     @staticmethod
-    def reduce_loss_in_tracker():
-        """Collect and reduce the indexer losses across ranks."""
+    def reduce_loss_in_tracker(
+        pipeline_group: torch.distributed.ProcessGroup | None,
+        data_parallel_group: torch.distributed.ProcessGroup | None,
+    ) -> None:
+        """Collect and reduce indexer diagnostics across explicit process groups."""
         tracker = DSAIndexerLossLoggingHelper.tracker
         if "values" not in tracker:
             return
+        if pipeline_group is None or data_parallel_group is None:
+            raise ValueError(
+                "DSA indexer metric reduction requires pipeline and data-parallel groups"
+            )
         values = tracker["values"]
+        kl_values = tracker["kl_values"]
         active_layers = tracker["active_layers"]
 
-        torch.distributed.all_reduce(
-            values, group=parallel_state.get_pipeline_model_parallel_group()
-        )
+        torch.distributed.all_reduce(values, group=pipeline_group)
+        torch.distributed.all_reduce(kl_values, group=pipeline_group)
         # Pipeline stages own disjoint layer ranges, so union their active-layer masks while
         # summing the corresponding loss slots.
         torch.distributed.all_reduce(
-            active_layers,
-            group=parallel_state.get_pipeline_model_parallel_group(),
-            op=torch.distributed.ReduceOp.MAX,
+            active_layers, group=pipeline_group, op=torch.distributed.ReduceOp.MAX
         )
         # Reduce indexer losses across ranks.
         if tracker.get('reduce_group') is not None:
             torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
+            torch.distributed.all_reduce(kl_values, group=tracker.get('reduce_group'))
         if tracker.get('avg_group') is not None:
             torch.distributed.all_reduce(
                 values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
             )
+            torch.distributed.all_reduce(
+                kl_values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
+            )
         torch.distributed.all_reduce(
-            values,
-            group=parallel_state.get_data_parallel_group(with_context_parallel=False),
-            op=torch.distributed.ReduceOp.AVG,
+            values, group=data_parallel_group, op=torch.distributed.ReduceOp.AVG
         )
+        torch.distributed.all_reduce(
+            kl_values, group=data_parallel_group, op=torch.distributed.ReduceOp.AVG
+        )
+
+        # Quality metrics are ratios of global sums. Pipeline stages own disjoint layers and
+        # context/data-parallel ranks own distinct rows, so sum both numerator and denominator.
+        metric_groups = (
+            pipeline_group,
+            tracker.get('reduce_group') or tracker.get('avg_group'),
+            data_parallel_group,
+        )
+        for metric_name in ("topk_recall", "attention_mass_recall"):
+            for group in metric_groups:
+                if group is not None:
+                    torch.distributed.all_reduce(tracker[f"{metric_name}_sum"], group=group)
+                    torch.distributed.all_reduce(tracker[f"{metric_name}_count"], group=group)
 
     @staticmethod
     def track_indexer_metrics(
@@ -397,6 +444,9 @@ class DSAIndexerLossLoggingHelper:
         total_loss_dict=None,
         per_layer_logging: bool = False,
         num_layers: int | None = None,
+        loss_coeff: float | None = None,
+        pipeline_group: torch.distributed.ProcessGroup | None = None,
+        data_parallel_group: torch.distributed.ProcessGroup | None = None,
     ):
         """Track the sparse attention indexer metrics for logging.
 
@@ -409,20 +459,36 @@ class DSAIndexerLossLoggingHelper:
             per_layer_logging: Whether to log per-layer losses.
             num_layers: Total transformer layers. Providing this lets pipeline stages with no DSA
                 layers initialize empty metric state and participate in cross-stage reductions.
+            loss_coeff: Configured KL coefficient. Passed explicitly because the logging pipeline
+                rank may own no DSA layers and therefore may not observe it during forward.
+            pipeline_group: Pipeline-parallel group used to combine disjoint layer metrics.
+            data_parallel_group: Data-parallel group used to average loss metrics and sum quality
+                metric numerators and denominators.
         """
         tracker = DSAIndexerLossLoggingHelper.tracker
         if "values" not in tracker:
             if num_layers is None:
                 return
             DSAIndexerLossLoggingHelper._initialize_tracker(num_layers)
-        DSAIndexerLossLoggingHelper.reduce_loss_in_tracker()
+        DSAIndexerLossLoggingHelper.reduce_loss_in_tracker(
+            pipeline_group=pipeline_group, data_parallel_group=data_parallel_group
+        )
 
         indexer_loss_values = tracker["values"] * loss_scale
+        indexer_kl_values = tracker["kl_values"] * loss_scale
         active_layer_count = tracker["active_layers"].sum().clamp_min(1)
 
         # Standard attention layers have no indexer objective. Average only over DSA layers that
         # produced a loss so the metric is comparable across mixed layer patterns.
         avg_indexer_loss = indexer_loss_values.sum() / active_layer_count
+        avg_indexer_kl = indexer_kl_values.sum() / active_layer_count
+
+        quality_values = {}
+        for metric_name in ("topk_recall", "attention_mass_recall"):
+            metric_sum = tracker[f"{metric_name}_sum"].sum()
+            metric_count = tracker[f"{metric_name}_count"].sum()
+            if metric_count > 0:
+                quality_values[metric_name] = metric_sum / metric_count
 
         # Log average loss
         if total_loss_dict is not None:
@@ -430,12 +496,63 @@ class DSAIndexerLossLoggingHelper:
                 total_loss_dict["indexer loss"] += avg_indexer_loss
             else:
                 total_loss_dict["indexer loss"] = avg_indexer_loss
+            total_loss_dict["indexer kl"] = total_loss_dict.get("indexer kl", 0) + avg_indexer_kl
+            if loss_coeff is not None:
+                total_loss_dict["indexer loss coefficient"] = total_loss_dict.get(
+                    "indexer loss coefficient", 0
+                ) + avg_indexer_loss.new_tensor(loss_coeff)
+            for metric_name, metric_value in quality_values.items():
+                display_name = f"indexer {metric_name.replace('_', ' ')}"
+                total_loss_dict[display_name] = total_loss_dict.get(display_name, 0) + metric_value
 
         if writer is not None:
             writer.add_scalar("indexer loss", avg_indexer_loss, iteration)
+            writer.add_scalar("indexer kl", avg_indexer_kl, iteration)
+            if loss_coeff is not None:
+                writer.add_scalar("indexer loss coefficient", loss_coeff, iteration)
+            for metric_name, metric_value in quality_values.items():
+                writer.add_scalar(
+                    f"indexer {metric_name.replace('_', ' ')}", metric_value, iteration
+                )
+            if per_layer_logging:
+                for layer_index in tracker["active_layers"].nonzero().flatten().tolist():
+                    writer.add_scalar(
+                        f"indexer kl/layer {layer_index + 1}",
+                        indexer_kl_values[layer_index],
+                        iteration,
+                    )
+                    for metric_name in ("topk_recall", "attention_mass_recall"):
+                        metric_count = tracker[f"{metric_name}_count"][layer_index]
+                        if metric_count > 0:
+                            writer.add_scalar(
+                                f"indexer {metric_name.replace('_', ' ')}/layer {layer_index + 1}",
+                                tracker[f"{metric_name}_sum"][layer_index] / metric_count,
+                                iteration,
+                            )
 
         if wandb_writer is not None:
-            wandb_writer.log({"indexer loss": avg_indexer_loss}, iteration)
+            wandb_metrics = {
+                "indexer loss": avg_indexer_loss,
+                "indexer kl": avg_indexer_kl,
+                **{
+                    f"indexer {metric_name.replace('_', ' ')}": metric_value
+                    for metric_name, metric_value in quality_values.items()
+                },
+            }
+            if loss_coeff is not None:
+                wandb_metrics["indexer loss coefficient"] = loss_coeff
+            if per_layer_logging:
+                for layer_index in tracker["active_layers"].nonzero().flatten().tolist():
+                    wandb_metrics[f"indexer kl/layer {layer_index + 1}"] = indexer_kl_values[
+                        layer_index
+                    ]
+                    for metric_name in ("topk_recall", "attention_mass_recall"):
+                        metric_count = tracker[f"{metric_name}_count"][layer_index]
+                        if metric_count > 0:
+                            wandb_metrics[
+                                f"indexer {metric_name.replace('_', ' ')}/layer {layer_index + 1}"
+                            ] = (tracker[f"{metric_name}_sum"][layer_index] / metric_count)
+            wandb_writer.log(wandb_metrics, iteration)
 
         DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
 
@@ -1152,6 +1269,7 @@ def fwd_blockwise_indexer_loss(
     use_relu: bool = True,
     block_size: int = 256,
     compute_topk: bool = True,
+    metrics_out: Optional[dict] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute top-k and Design-A KL with bounded query/key score blocks."""
     query, _ = dsa_layout.ensure_sbhd(query, "query")
@@ -1188,6 +1306,11 @@ def fwd_blockwise_indexer_loss(
     else:
         topk_indices = torch.empty((b, sq, 0), dtype=torch.int64, device=q.device)
 
+    collect_quality_metrics = metrics_out is not None and compute_topk and not sparse_loss
+    topk_recall_sum = torch.zeros((), dtype=torch.float32, device=q.device)
+    topk_recall_count = torch.zeros((), dtype=torch.float32, device=q.device)
+    attention_mass_recall_sum = torch.zeros((), dtype=torch.float32, device=q.device)
+    attention_mass_recall_count = torch.zeros((), dtype=torch.float32, device=q.device)
     kl_sum = torch.zeros((), dtype=torch.float32, device=q.device)
     for q_start in range(0, sq, block_size):
         q_end = min(q_start + block_size, sq)
@@ -1212,6 +1335,14 @@ def fwd_blockwise_indexer_loss(
             use_relu=use_relu,
         )
         row_kl = torch.zeros((b, q_end - q_start), dtype=torch.float32, device=q.device)
+        teacher_topk_scores = None
+        teacher_topk_indices = None
+        attention_mass_per_row = torch.zeros_like(row_kl)
+        indexer_support = (
+            _build_sparse_support(topk_indices[:, q_start:q_end], sk)
+            if collect_quality_metrics
+            else None
+        )
         for k_start in range(0, sk, block_size):
             k_end = min(k_start + block_size, sk)
             valid, bias = _indexer_loss_block_mask(
@@ -1233,6 +1364,21 @@ def fwd_blockwise_indexer_loss(
             )
             teacher_logits = _masked_block_logits(teacher_logits, valid, bias)
             target = _blockwise_teacher_target(teacher_logits, teacher_norm, valid, pg_collection)
+            if collect_quality_metrics:
+                attention_mass_per_row += (
+                    target * indexer_support[..., k_start:k_end].to(dtype=target.dtype)
+                ).sum(dim=-1)
+                teacher_scores = target.masked_fill(~valid, float("-inf"))
+                teacher_indices = torch.arange(
+                    k_start, k_end, dtype=torch.int64, device=q.device
+                ).view(1, 1, -1)
+                teacher_indices = teacher_indices.expand(b, q_end - q_start, -1)
+                if teacher_topk_scores is not None:
+                    teacher_scores = torch.cat((teacher_topk_scores, teacher_scores), dim=-1)
+                    teacher_indices = torch.cat((teacher_topk_indices, teacher_indices), dim=-1)
+                keep = min(topk_indices.size(-1), teacher_scores.size(-1))
+                teacher_topk_scores, teacher_order = teacher_scores.topk(keep, dim=-1)
+                teacher_topk_indices = torch.gather(teacher_indices, dim=-1, index=teacher_order)
             student_logits = _compute_index_scores(
                 q[q_start:q_end], weights[q_start:q_end], k[k_start:k_end], use_relu=use_relu
             )
@@ -1245,6 +1391,25 @@ def fwd_blockwise_indexer_loss(
             row_kl *= query_valid_rows[:, q_start:q_end].to(dtype=row_kl.dtype)
         kl_sum += row_kl.sum()
 
+        if collect_quality_metrics:
+            teacher_topk_indices = teacher_topk_indices.masked_fill(
+                teacher_topk_scores == float("-inf"), -1
+            )
+            indexer_block_topk = topk_indices[:, q_start:q_end]
+            teacher_topk_valid = teacher_topk_indices >= 0
+            row_valid = teacher_topk_valid.any(dim=-1)
+            if query_valid_rows is not None:
+                row_valid &= query_valid_rows[:, q_start:q_end]
+            overlap = (
+                teacher_topk_indices.unsqueeze(-1) == indexer_block_topk.unsqueeze(-2)
+            ) & teacher_topk_valid.unsqueeze(-1)
+            overlap_count = overlap.any(dim=-1).sum(dim=-1).float()
+            teacher_count = teacher_topk_valid.sum(dim=-1).float()
+            topk_recall_sum += (overlap_count * row_valid).sum()
+            topk_recall_count += (teacher_count * row_valid).sum()
+            attention_mass_recall_sum += (attention_mass_per_row * row_valid).sum()
+            attention_mass_recall_count += row_valid.sum()
+
     valid_row_count = query_valid_rows.sum() if query_valid_rows is not None else None
     loss = dsa_indexer_loss.reduce_indexer_kl_sum(
         kl_sum,
@@ -1252,6 +1417,15 @@ def fwd_blockwise_indexer_loss(
         calculate_per_token_loss=calculate_per_token_loss,
         valid_row_count=valid_row_count,
     )
+    if metrics_out is not None:
+        metrics_out.update(
+            {
+                "topk_recall_sum": topk_recall_sum,
+                "topk_recall_count": topk_recall_count,
+                "attention_mass_recall_sum": attention_mass_recall_sum,
+                "attention_mass_recall_count": attention_mass_recall_count,
+            }
+        )
     return topk_indices, loss * loss_coeff
 
 
@@ -1400,6 +1574,7 @@ _FUSED_DSA_INDEXER_LOSS_INPUT_NAMES = (
     "use_relu",
     "block_size",
     "compute_topk",
+    "metrics_out",
 )
 
 
@@ -1428,6 +1603,7 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
         use_relu: bool = True,
         block_size: int = 256,
         compute_topk: bool = True,
+        metrics_out: Optional[dict] = None,
     ):
         """Compute top-k and indexer loss without full score tensors."""
         topk_indices, loss = fwd_blockwise_indexer_loss(
@@ -1450,6 +1626,7 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
             use_relu=use_relu,
             block_size=block_size,
             compute_topk=compute_topk,
+            metrics_out=metrics_out,
         )
 
         # Save for backward (recomputation strategy)
@@ -1749,6 +1926,10 @@ class DSAIndexer(MegatronModule):
         # should be averaged during final gradient synchronization.
         for param in self.parameters():
             setattr(param, "average_gradients_across_tp_domain", True)
+            # Optimizer metadata used for the separate indexer LR schedule and gradient
+            # diagnostics. Unlike grad_norm_group, this does not alter clipping; indexer and
+            # backbone gradients continue to use the same global clipping coefficient.
+            setattr(param, "is_dsa_indexer_parameter", True)
 
     def _apply_rope(
         self,
@@ -2539,6 +2720,7 @@ class DSAttention(MegatronModule):
         topk_indices = None
         topk_length = None
         q = k = weights = None
+        quality_metrics = {}
         local_packed_cp_query_start = 0
         local_packed_cp_query_len = sq
         if sequence_parallel_query_is_local:
@@ -2619,7 +2801,10 @@ class DSAttention(MegatronModule):
                 self.config.calculate_per_token_loss,
                 self.config.dsa_indexer_scoring_relu,
                 self.config.dsa_indexer_loss_block_size,
-                dense_output is None,
+                # Phase-1 dense warmup does not consume sparse attention output, but its
+                # diagnostics still need the indexer's selected keys for top-k and mass recall.
+                True,
+                quality_metrics,
             )
 
         fused_output = None
@@ -2665,6 +2850,7 @@ class DSAttention(MegatronModule):
                     loss=indexer_loss,
                     layer_number=self.layer_number,
                     num_layers=self.config.num_layers,
+                    loss_coeff=indexer_loss_coeff,
                     reduce_group=indexer_reduce_group,
                     avg_group=indexer_avg_group,
                 )
@@ -2752,6 +2938,8 @@ class DSAttention(MegatronModule):
                     loss=indexer_loss,
                     layer_number=self.layer_number,
                     num_layers=self.config.num_layers,
+                    loss_coeff=indexer_loss_coeff,
+                    quality_metrics=quality_metrics or None,
                     reduce_group=indexer_reduce_group,
                     avg_group=indexer_avg_group,
                 )

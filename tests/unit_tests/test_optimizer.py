@@ -91,6 +91,71 @@ def test_copy_optimizer_param_metadata_preserves_allreduce():
     assert destination.allreduce is False
 
 
+def test_copy_optimizer_param_metadata_preserves_dsa_indexer_tag():
+    source = torch.empty(1)
+    destination = torch.empty_like(source)
+    source.is_dsa_indexer_parameter = True
+
+    copy_optimizer_param_metadata(destination, source)
+
+    assert destination.is_dsa_indexer_parameter is True
+
+
+def test_dsa_grad_norm_split_does_not_change_main_norm():
+    from megatron.core.optimizer.optimizer import MegatronOptimizer
+
+    class MockOptimizer:
+        _compute_dsa_grad_norms = MegatronOptimizer._compute_dsa_grad_norms
+
+        def has_dsa_indexer_params(self):
+            return True
+
+        def _get_dsa_indexer_grad_norm(self):
+            return 3.0
+
+    optimizer = MockOptimizer()
+
+    norms = optimizer._compute_dsa_grad_norms(total_grad_norm=5.0)
+
+    assert norms == {'indexer': 3.0, 'base': 4.0}
+
+
+def test_dsa_indexer_tag_does_not_exclude_from_main_grad_norm():
+    from megatron.core.optimizer.optimizer import MegatronOptimizer
+
+    class MockOptimizer:
+        _filter_grads_for_norm = MegatronOptimizer._filter_grads_for_norm
+        get_grads_for_grad_norm = MegatronOptimizer.get_grads_for_grad_norm
+        get_dsa_indexer_grads_for_norm = MegatronOptimizer.get_dsa_indexer_grads_for_norm
+
+        def __init__(self, params):
+            self.params = list(params)
+            self.config = OptimizerConfig(optimizer='adam', lr=0.01)
+
+        def get_parameters(self):
+            return self.params
+
+    Utils.initialize_model_parallel()
+    try:
+        base_param = torch.nn.Parameter(torch.randn(4, device='cuda'))
+        indexer_param = torch.nn.Parameter(torch.randn(4, device='cuda'))
+        indexer_param.is_dsa_indexer_parameter = True
+        base_param.grad = torch.ones_like(base_param)
+        indexer_param.grad = torch.ones_like(indexer_param)
+
+        optimizer = MockOptimizer([base_param, indexer_param])
+
+        main_grads = optimizer.get_grads_for_grad_norm()
+        indexer_grads = optimizer.get_dsa_indexer_grads_for_norm()
+        assert len(main_grads) == 2
+        assert main_grads[0] is base_param.grad
+        assert main_grads[1] is indexer_param.grad
+        assert len(indexer_grads) == 1
+        assert indexer_grads[0] is indexer_param.grad
+    finally:
+        Utils.destroy_model_parallel()
+
+
 @patch('torch.distributed.get_world_size', return_value=1)
 @patch(
     'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
@@ -136,6 +201,62 @@ def test_get_param_groups_default_overrides(mock_get_world_size):
     pg0, pg1 = param_groups
     wd_mults = {pg0['wd_mult'], pg1['wd_mult']}
     assert wd_mults == {1.0, 0.0}
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+)
+def test_dsa_indexer_uses_separate_lr_schedule(mock_get_world_size):
+    net = Net()
+    indexer_param = net.fc1.weight
+    indexer_param.is_dsa_indexer_parameter = True
+    config = OptimizerConfig(
+        optimizer='adam', lr=1.0e-5, min_lr=1.0e-6, dsa_indexer_lr=1.0e-4, dsa_indexer_min_lr=1.0e-5
+    )
+
+    param_groups = _get_param_groups([net], config, get_standard_config_overrides(config))
+    indexer_group = next(
+        group for group in param_groups if any(param is indexer_param for param in group['params'])
+    )
+    base_group = next(
+        group for group in param_groups if any(param is net.fc2.weight for param in group['params'])
+    )
+
+    assert indexer_group['max_lr'] == 1.0e-4
+    assert indexer_group['min_lr'] == 1.0e-5
+    assert indexer_group['default_config'] is False
+    assert base_group['max_lr'] == 1.0e-5
+    assert base_group['min_lr'] == 1.0e-6
+    assert base_group['default_config'] is True
+
+
+def test_dsa_indexer_min_lr_defaults_to_base_min_lr():
+    config = OptimizerConfig(optimizer='adam', lr=1.0e-5, min_lr=1.0e-6, dsa_indexer_lr=1.0e-4)
+
+    override = get_standard_config_overrides(config)[ParamKey(attr='is_dsa_indexer_parameter')]
+
+    assert override == {'max_lr': 1.0e-4}
+
+
+@pytest.mark.parametrize(
+    ('kwargs', 'message'),
+    [
+        ({'dsa_indexer_lr': -1.0}, 'dsa_indexer_lr must be non-negative'),
+        ({'dsa_indexer_min_lr': 1.0e-6}, 'dsa_indexer_min_lr requires dsa_indexer_lr'),
+        (
+            {'dsa_indexer_lr': 1.0e-5, 'dsa_indexer_min_lr': 2.0e-5},
+            'DSA indexer minimum learning rate must not exceed dsa_indexer_lr',
+        ),
+        (
+            {'min_lr': 2.0e-5, 'dsa_indexer_lr': 1.0e-5},
+            'DSA indexer minimum learning rate must not exceed dsa_indexer_lr',
+        ),
+    ],
+)
+def test_dsa_indexer_lr_validation(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        OptimizerConfig(optimizer='adam', lr=1.0e-5, **kwargs)
 
 
 @patch('torch.distributed.get_world_size', return_value=1)
