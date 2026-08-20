@@ -305,6 +305,17 @@ class DSAIndexerLossLoggingHelper:
     tracker = {}
 
     @staticmethod
+    def _initialize_tracker(num_layers: int) -> None:
+        """Allocate per-layer metric state on the current CUDA device."""
+        tracker = DSAIndexerLossLoggingHelper.tracker
+        if "values" in tracker:
+            return
+        tracker["values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+        tracker["active_layers"] = torch.zeros(
+            num_layers, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+
+    @staticmethod
     def save_loss_to_tracker(
         loss: torch.Tensor,
         layer_number: int,
@@ -326,9 +337,12 @@ class DSAIndexerLossLoggingHelper:
             return
 
         tracker = DSAIndexerLossLoggingHelper.tracker
-        if "values" not in tracker:
-            tracker["values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
-        tracker["values"][layer_number - 1] += loss.detach()
+        DSAIndexerLossLoggingHelper._initialize_tracker(num_layers)
+        layer_index = layer_number - 1
+        tracker["values"][layer_index] += loss.detach()
+        # Track participation explicitly: a valid DSA layer can have exactly zero KL and must
+        # still contribute to the active-layer denominator.
+        tracker["active_layers"][layer_index] = 1
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
 
@@ -338,6 +352,7 @@ class DSAIndexerLossLoggingHelper:
         tracker = DSAIndexerLossLoggingHelper.tracker
         if "values" in tracker:
             tracker["values"].zero_()
+            tracker["active_layers"].zero_()
         tracker["reduce_group"] = None
         tracker["avg_group"] = None
 
@@ -348,9 +363,17 @@ class DSAIndexerLossLoggingHelper:
         if "values" not in tracker:
             return
         values = tracker["values"]
+        active_layers = tracker["active_layers"]
 
         torch.distributed.all_reduce(
             values, group=parallel_state.get_pipeline_model_parallel_group()
+        )
+        # Pipeline stages own disjoint layer ranges, so union their active-layer masks while
+        # summing the corresponding loss slots.
+        torch.distributed.all_reduce(
+            active_layers,
+            group=parallel_state.get_pipeline_model_parallel_group(),
+            op=torch.distributed.ReduceOp.MAX,
         )
         # Reduce indexer losses across ranks.
         if tracker.get('reduce_group') is not None:
@@ -373,6 +396,7 @@ class DSAIndexerLossLoggingHelper:
         wandb_writer=None,
         total_loss_dict=None,
         per_layer_logging: bool = False,
+        num_layers: int | None = None,
     ):
         """Track the sparse attention indexer metrics for logging.
 
@@ -383,17 +407,22 @@ class DSAIndexerLossLoggingHelper:
             wandb_writer: Weights & Biases writer.
             total_loss_dict: Dictionary to accumulate total losses.
             per_layer_logging: Whether to log per-layer losses.
+            num_layers: Total transformer layers. Providing this lets pipeline stages with no DSA
+                layers initialize empty metric state and participate in cross-stage reductions.
         """
-        DSAIndexerLossLoggingHelper.reduce_loss_in_tracker()
         tracker = DSAIndexerLossLoggingHelper.tracker
         if "values" not in tracker:
-            return
+            if num_layers is None:
+                return
+            DSAIndexerLossLoggingHelper._initialize_tracker(num_layers)
+        DSAIndexerLossLoggingHelper.reduce_loss_in_tracker()
 
         indexer_loss_values = tracker["values"] * loss_scale
-        num_layers = indexer_loss_values.shape[0]
+        active_layer_count = tracker["active_layers"].sum().clamp_min(1)
 
-        # Average across all layers (assuming all layers have sparse attention)
-        avg_indexer_loss = indexer_loss_values.sum() / num_layers
+        # Standard attention layers have no indexer objective. Average only over DSA layers that
+        # produced a loss so the metric is comparable across mixed layer patterns.
+        avg_indexer_loss = indexer_loss_values.sum() / active_layer_count
 
         # Log average loss
         if total_loss_dict is not None:

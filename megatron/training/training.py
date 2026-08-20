@@ -2948,6 +2948,7 @@ def training_log(
             writer=writer,
             wandb_writer=wandb_writer,
             total_loss_dict=total_loss_dict,
+            num_layers=args.num_layers,
         )
 
     # Dump memory snapshot and print metrics to stdout.

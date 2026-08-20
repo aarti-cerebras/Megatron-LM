@@ -12,6 +12,7 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 )
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.experimental_attention_variant.dsa import (
+    DSAIndexerLossLoggingHelper,
     DSAttention,
     _compute_grouped_attention_scores,
     _compute_index_scores,
@@ -89,6 +90,47 @@ def test_grouped_teacher_scores_match_explicit_gqa_reference():
     )
 
     torch.testing.assert_close(actual, expected)
+
+
+def test_indexer_metric_averages_only_active_dsa_layers(monkeypatch):
+    helper = DSAIndexerLossLoggingHelper
+    helper.tracker.clear()
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(helper, "reduce_loss_in_tracker", lambda: None)
+
+    # Two microbatches on DSA layers 2 and 4. Layer 2 has a valid zero KL and must still count.
+    helper.save_loss_to_tracker(torch.tensor(0.0), layer_number=2, num_layers=4)
+    helper.save_loss_to_tracker(torch.tensor(0.0), layer_number=2, num_layers=4)
+    helper.save_loss_to_tracker(torch.tensor(8.0), layer_number=4, num_layers=4)
+    helper.save_loss_to_tracker(torch.tensor(4.0), layer_number=4, num_layers=4)
+
+    total_loss_dict = {}
+    helper.track_indexer_metrics(
+        loss_scale=0.5, iteration=1, writer=None, total_loss_dict=total_loss_dict
+    )
+
+    # Microbatch means are 0 and 6 for the two active layers, hence an active-layer mean of 3.
+    torch.testing.assert_close(total_loss_dict["indexer loss"], torch.tensor(3.0))
+    assert helper.tracker["active_layers"].count_nonzero() == 0
+
+
+def test_indexer_metric_initializes_pipeline_stage_without_dsa_layers(monkeypatch):
+    helper = DSAIndexerLossLoggingHelper
+    helper.tracker.clear()
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+
+    def simulate_pipeline_reduction():
+        helper.tracker["values"][3] = 8.0
+        helper.tracker["active_layers"][3] = 1
+
+    monkeypatch.setattr(helper, "reduce_loss_in_tracker", simulate_pipeline_reduction)
+    total_loss_dict = {}
+
+    helper.track_indexer_metrics(
+        loss_scale=1.0, iteration=1, writer=None, total_loss_dict=total_loss_dict, num_layers=4
+    )
+
+    torch.testing.assert_close(total_loss_dict["indexer loss"], torch.tensor(8.0))
 
 
 def test_dsa_gqa_phase1_spec_uses_standard_attention_and_external_norm():
