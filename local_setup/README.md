@@ -47,12 +47,10 @@ Already present and relevant:
 | `datasets/livecodebench`, `datasets/gsm8k` | eval sets |
 | `dsa/`, `dsa_qwen3/{indexer_warmup,sparse}` | prior DSA work (MiniCPM3, Qwen3) incl. `dsa/handoff/minicpm3-dsa-handoff` |
 
-One remaining data consequence for the run scripts:
-
-- **The IFT data is HF Arrow**, so it cannot feed `--data-path` directly. It needs
-  either conversion to Megatron indexed format via `tools/preprocess_data.py`, or
-  routing through `megatron/training/datasets/sft_dataset.py`, which expects jsonl
-  conversations.
+The SFT loader accepts either conversation JSONL or pretokenized Parquet containing
+`input_ids`, `loss_mask`, and `length`. Pretokenized GPT-OSS rows bypass chat rendering but still
+run through the same Harmony assistant-target parser; the stored mask is checked to ensure it does
+not omit any canonical assistant payload or terminator targets.
 
 ---
 
@@ -260,10 +258,46 @@ bash local_setup/validate_gpt_oss_20b_dsa_phase2_sft.sh
 
 The validation script defaults to
 `local_setup/gpt_oss_dsa/phase2_smoke_data.jsonl`, a synthetic plumbing fixture rather than a
-training dataset. Set `SFT_DATA_PATH` to a prepared conversation JSONL for a real run. The Phase 2
+training dataset. Set `SFT_DATA_PATH` to either a conversation JSONL or a split Parquet directory
+containing `train-00000.parquet`, `val-00000.parquet`, and preferably `MANIFEST.json`. For example:
+
+```bash
+SFT_DATA_PATH=/cb/ml-eng/aarti/msa/data/gpt-oss-20b__dolci-think-rl-32b__ph2b_full93889_effmedium_L32768_20260809__split_v1 \
+TRAIN_ITERS=2 SEQ_LENGTH=4096 \
+bash local_setup/validate_gpt_oss_20b_dsa_phase2_sft.sh
+```
+
+The run directory records the source paths, copies the small dataset manifest, and writes SHA-256
+digests for the Parquet shards instead of copying the training data. The Phase 2
 recipe deliberately omits `--dsa-dense-warmup` and `--dsa-freeze-base`, keeps the Phase 1 model and
 indexer geometry, uses `dsa_kernel_backend=none`, and supplies `--finetune --no-load-optim
 --no-load-rng` so Phase 1 optimizer/scheduler state cannot leak into the new schedule.
+
+Do not point the sequence-128 Gate B run at the full 32K split: most prompts consume the entire
+window. Build a deterministic short-prefix view that retains at least 16 canonical assistant target
+tokens and balances the 512 training samples across the four domains:
+
+```bash
+MODE=exec bash local_setup/launch_container.sh \
+  /opt/venv/bin/python local_setup/gpt_oss_dsa/prepare_phase2_gateb_data.py \
+  /cb/ml-eng/aarti/msa/data/gpt-oss-20b__dolci-think-rl-32b__ph2b_full93889_effmedium_L32768_20260809__split_v1 \
+  /cb/ml-eng/aarti/msa/data/gpt-oss-20b__dolci-think-rl-32b__ph2b_gateb_seq128_min16_n512_20260821_v3 \
+  /cb/ml-eng/aarti/models/gpt-oss-20b
+```
+
+Then run Gate B with that derived split:
+
+```bash
+SFT_DATA_PATH=/cb/ml-eng/aarti/msa/data/gpt-oss-20b__dolci-think-rl-32b__ph2b_gateb_seq128_min16_n512_20260821_v3 \
+TRAIN_ITERS=20 SEQ_LENGTH=128 SAVE_CHECKPOINT=0 \
+bash local_setup/validate_gpt_oss_20b_dsa_phase2_sft.sh
+```
+
+The 20-step Gate B run passed on 2026-08-21 using the v3 split above and the bias-correct Phase 1
+iteration-100 checkpoint. Its reproducibility bundle is at
+`/cb/ml-eng/aarti/mcore_runs/gptoss20b_dsa_phase2_gateb20_seq128_v3_20260821T205700Z`. All steps
+had finite LM/KL losses, nonzero base and indexer gradients, and zero skipped or NaN iterations;
+rank 0 peaked at 59,567.23 MB allocated and 59,696.00 MB reserved.
 
 Architecture args are taken from two in-repo sources of truth:
 - `examples/post_training/modelopt/conf/openai/gpt-oss-20b.sh`
@@ -352,11 +386,11 @@ The HF checkpoint has been converted with the in-repo ModelOpt path, a bias-corr
 Phase 1 checkpoint is saved, and the two-step Phase 2 transition gate passes. A real Phase 2
 finetune still needs:
 
-1. **Real data.** `tools/preprocess_data.py` -> `.bin`/`.idx` for continued
-   pretraining, or `megatron/training/datasets/sft_dataset.py` for packed,
-   prompt-masked conversation SFT.
+1. **Real-data rollout.** The selected 91,631-row GPT-OSS behavior-cloning Parquet split is wired
+   into `SFTDataset` and the 20-step Gate B passed; run the measured 4K/8K gates before sustained
+   training.
 2. **Production diagnostics and rollout gates.** Complete the diagnostic set, functional test,
-   real-data 20-step gate, and measured 4K/8K memory/performance gates.
+   and measured 4K/8K memory/performance gates.
 3. **Long-run recipe selection.** Tune the base/indexer schedules from observed gradient norms and
    decide checkpoint frequency with the measured distributed-optimizer checkpoint size in mind.
 

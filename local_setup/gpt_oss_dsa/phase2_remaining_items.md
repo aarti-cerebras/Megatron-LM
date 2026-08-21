@@ -2,26 +2,23 @@
 
 **Audit date:** 2026-08-21
 **Branch inspected:** `aarti/gpt-oss-dsa`
-**HEAD inspected:** `7aeefd9eb` (`Add real-token masking for GPT-OSS DSA SFT`)
+**HEAD inspected:** `7a1c5d577` (`Validate GPT-OSS DSA Phase 2 transition`)
 
 ## Summary
 
-Phase 2 is not yet runnable end to end. Workstream A, sink-aware GQA sparse attention, and
-Workstream B, SFT real-token provenance and assistant-only supervision, are committed. Their full
-focused suites pass under the repository container on 8 H100s with the installed native GPT-OSS
-tokenizer. GPT-OSS attention-bias fidelity is resolved, and a bias-correct 100-step Phase 1
-checkpoint containing trained indexer state is available. Helper-only reduction assertions,
-prompt-gradient coverage, native-tokenizer edge cases, and distributed-optimizer/Megatron-FSDP
-coverage still need stronger integration tests. The Phase 1-to-Phase 2 transition now passes on the
-full 20B model: the actual iteration-100 checkpoint loads model-only, a fresh joint optimizer and
-schedule run two native-Harmony SFT steps with finite base/indexer gradients, and the resulting
-Phase 2 checkpoint saves successfully. Reproducible Phase 2 train/run/validate launchers are now
-available. Phase 2 diagnostics, functional coverage, real SFT data, and rollout validation remain
-open.
+Phase 2 now runs end to end on real pretokenized GPT-OSS SFT data. Workstream A, sink-aware GQA
+sparse attention, and Workstream B, SFT real-token provenance and assistant-only supervision, are
+committed. Their focused suites pass under the repository container on 8 H100s with the installed
+native GPT-OSS tokenizer. GPT-OSS attention-bias fidelity is resolved, a bias-correct 100-step
+Phase 1 checkpoint containing trained indexer state is available, and the 20-step full-model Gate B
+passed with finite losses and gradients. The selected 91,631/510-row source split now has a
+deterministic, domain-balanced sequence-128 Gate B view consumed losslessly through `SFTDataset`.
+Helper-only reduction assertions, prompt-gradient coverage, native-tokenizer edge cases,
+distributed-optimizer/Megatron-FSDP coverage, production diagnostics, functional coverage, and the
+4K/8K rollout gates remain open.
 
-The highest-priority dependency is now preparing and validating the real conversation SFT dataset,
-then running Gate B for 20 steps with the new Phase 2 recipe. That run must exercise realistic data
-variation, confirm stable base/indexer gradient balance, and provide the remaining diagnostics.
+The highest-priority next milestone is Gate C at sequence 4K, preceded by the missing production
+diagnostics needed to interpret memory, target composition, sink mass, and per-stage timing.
 
 ## Current state
 
@@ -40,6 +37,8 @@ variation, confirm stable base/indexer gradient balance, and provide the remaini
 - [x] Strictly transition that checkpoint into the full 20B Phase 2 SFT model and run joint
   base/indexer optimization.
 - [x] Add reproducible Phase 2 SFT train, run, and validation launchers.
+- [x] Add lossless pretokenized-Parquet SFT ingestion and prepare a deterministic Gate B split.
+- [x] Pass the 20-step full-model Gate B on real GPT-OSS SFT data.
 
 ### Completed validation
 
@@ -231,8 +230,8 @@ Each run directory must record:
 
 The initial Phase 2 recipe must retain the Phase 1 model/indexer geometry, use sparse attention with
 `dsa_kernel_backend=none`, omit `dsa_dense_warmup` and `dsa_freeze_base`, retain full-support indexer
-KL, and consume SFT conversation JSONL through `SFTTokenizer` with the validated `gpt-oss` prompt
-format.
+KL, and consume either conversation JSONL or validated pretokenized Parquet through `SFTDataset`
+with the native GPT-OSS tokenizer and assistant-target contract.
 
 The two-step smoke gate satisfies this recipe contract. Its bundled JSONL is intentionally synthetic
 and validates plumbing only; it does not satisfy the real-data requirements in section 6 or the
@@ -240,14 +239,52 @@ and validates plumbing only; it does not satisfy the real-data requirements in s
 
 ### 6. Prepare real SFT data
 
-The existing GPT-OSS IFT datasets are stored as Hugging Face Arrow and cannot be supplied directly
-to the current SFT `--data-path`. Required work:
+The selected behavior-cloning dataset is:
 
-- [ ] Select the Phase 2 SFT dataset and document its schema and provenance.
-- [ ] Convert or export it to the conversation JSONL schema consumed by `SFTDataset`.
+`/cb/ml-eng/aarti/msa/data/gpt-oss-20b__dolci-think-rl-32b__ph2b_full93889_effmedium_L32768_20260809__split_v1`
+
+Its immutable split manifest records GPT-OSS 20B generation from
+`allenai/Dolci-Think-RL-32B` prompts (ODC-BY), Harmony chat format, medium reasoning effort,
+temperature/top-p `1.0`, seed `1234`, a 32,768-token window, pinned date `2026-08-09`, and generator
+commit `67368270cb8bac19412c0109910524fe769793a1`. The split contains 91,631 training rows
+(416,780,176 tokens) and 510 validation rows (2,141,413 tokens), stratified by frozen prompt hashes
+with zero train/validation prompt overlap. Each Parquet row contains `input_ids`, `loss_mask`,
+`length`, bucket/domain/language/source metadata, prompt provenance, prefix/response counts, finish
+reason, and sample index.
+
+Required work:
+
+- [x] Select the Phase 2 SFT dataset and document its schema and provenance.
+- [x] Add a lossless pretokenized-Parquet path to `SFTDataset`; do not decode and re-tokenize the
+  existing GPT-OSS token IDs.
 - [ ] Validate representative system, developer, user, assistant, and tool conversations.
-- [ ] Record dataset paths and immutable version/manifest information in every run directory.
-- [ ] Check packing, truncation, token fractions, and assistant-target counts before a long run.
+- [x] Record dataset paths, the split manifest, and shard SHA-256 digests in every run directory.
+- [x] Check packing, truncation, token fractions, and assistant-target counts before a long run.
+
+Data-quality record (2026-08-21):
+
+- All scalar fields are non-null; all 91,631 train and 510 validation prompt hashes are unique;
+  cross-split prompt overlap is zero.
+- Token IDs fit the installed GPT-OSS tokenizer, masks are binary, and sampled canonical Harmony
+  payload/terminator targets are contained in the stored masks. The adapter reconstructs canonical
+  targets rather than supervising the source mask's additional generated channel-header tokens.
+- One training row (`40517`) has stale `resp_tokens` metadata (`6503` versus 6504 mask tokens), but
+  its `input_ids`, `loss_mask`, and `length` are internally consistent. The adapter never derives
+  supervision from `resp_tokens`.
+- At sequence 128, 21,026 rows retain any response and only 0.15% of all response tokens survive;
+  70,605 prompts fill the entire window. Gate B must therefore use a short-prefix filtered view,
+  not uniform sampling from the full split. Sequence 4,096 retains 54.20% of response tokens;
+  sequence 8,192 retains 76.77%; sequence 32,768 retains 100%.
+- The deterministic Gate B view is
+  `/cb/ml-eng/aarti/msa/data/gpt-oss-20b__dolci-think-rl-32b__ph2b_gateb_seq128_min16_n512_20260821_v3`.
+  It contains 512 training rows balanced exactly across Code, General, IF, and Math (128 each),
+  plus all 85 eligible validation rows. Every selected response contributes at least 16 visible
+  target tokens at sequence 128.
+- Exhaustive validation through the production tokenizer and `SFTDataset` found 14,794 canonical
+  train targets and 2,637 validation targets, a minimum of 16 targets per row, unique prompt hashes
+  within each split, and zero cross-split prompt overlap. Train/validation shard SHA-256 digests are
+  `bca55c68051a7b851cc8d2966c7d753f4981c5b5d233e211d56d9097792a9faf` and
+  `7184ef56f8208f9b6d2bc5acc3e3521bc1fecd0edcbb1b021731718d0132ccb2`.
 
 ### 7. Add the functional test and CI recipe
 
@@ -272,6 +309,28 @@ to the current SFT `--data-path`. Required work:
 | D | Sequence 8K; realistic K | Measured throughput and peak memory; stable sparse sink mass |
 | E | Longer SFT run | Short- and long-context evaluation within agreed dense-baseline tolerances |
 | F | 32K candidate | Run only after quadratic cost is accepted or optimized |
+
+Gate status:
+
+- [ ] Gate A: explicit full-legal-key parity rollout remains to be recorded.
+- [x] Gate B: the 20-step real-data rollout passed.
+- [ ] Gates C-F remain open.
+
+Gate B validation record (2026-08-21):
+
+- Run directory:
+  `/cb/ml-eng/aarti/mcore_runs/gptoss20b_dsa_phase2_gateb20_seq128_v3_20260821T205700Z`.
+- The full GPT-OSS 20B model strictly loaded the bias-correct Phase 1 iteration-100 model state and
+  ran 20 optimizer steps on 8 H100s with global batch size 8, top-K 64, and checkpoint saving
+  disabled.
+- Step 1 logged LM loss `0.830987`, indexer KL `1.163415`, base/indexer gradient norms
+  `42.611`/`190.939`, and base/indexer learning rates `1e-5`/`1e-4`. Step 20 logged LM loss
+  `0.575799`, indexer KL `0.326077`, gradient norms `21.529`/`12.024`, and the configured minimum
+  learning rates `1e-6`/`1e-5`.
+- Top-K recall rose from `0.831527` to `0.908104`; captured indexer attention mass rose from
+  `0.914117` to `0.977724`; attention-score recall rose from `0.917285` to `0.982757`.
+- All steps reported finite losses and nonzero base/indexer gradients, with zero skipped and zero
+  NaN iterations. Rank 0 peaked at `59,567.23` MB allocated and `59,696.00` MB reserved.
 
 At the Phase 1 exit and throughout Phase 2, evaluate indexer quality at the K intended for Phase 2.
 Tune `dsa_indexer_loss_coeff` from the observed base/indexer gradient norms rather than carrying over
@@ -302,9 +361,10 @@ SM90 remains unverified.
   A ModelOpt-converted MCore checkpoint exists, and its attention-bias fidelity is now validated by
   the bias-correct Phase 1 load/save/reload runs.
 
-The README should state that the remaining real-finetune prerequisites are prepared conversation
-SFT data, production diagnostics, a functional test, and the rollout gates above. The bias-correct
-Phase 1 checkpoint, live 20B transition, and initial Phase 2 launch recipes are now available.
+The README should state that real SFT data and Gate B are complete. Remaining sustained-finetune
+prerequisites are production diagnostics, a functional test, the 4K/8K rollout gates, and an
+explicit decision on the quadratic long-context execution cost. The bias-correct Phase 1
+checkpoint, live 20B transition, and Phase 2 launch recipes are available.
 
 ## Separate later milestones
 

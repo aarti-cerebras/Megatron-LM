@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Train GPT-OSS 20B Phase 2 with joint base/indexer optimization on conversation SFT data.
+# Train GPT-OSS 20B Phase 2 with joint base/indexer optimization on SFT data.
 set -euo pipefail
 
 PHASE1_CHECKPOINT_DIR=${1:?"usage: $0 PHASE1_CHECKPOINT_DIR HF_MODEL_DIR SFT_DATA_PATH RUN_DIR"}
@@ -26,8 +26,8 @@ if [[ "$GPUS_PER_NODE" != "8" ]]; then
     echo "this checkpoint uses EP=8; GPUS_PER_NODE must be 8" >&2
     exit 1
 fi
-if [[ ! -f "$SFT_DATA_PATH" ]]; then
-    echo "SFT conversation JSONL does not exist: $SFT_DATA_PATH" >&2
+if [[ ! -f "$SFT_DATA_PATH" && ! -d "$SFT_DATA_PATH" ]]; then
+    echo "SFT data path does not exist: $SFT_DATA_PATH" >&2
     exit 1
 fi
 
@@ -136,12 +136,24 @@ DATA_ARGS=(
     --tokenizer-model "$HF_MODEL_DIR"
     --sft-tokenizer-prompt-format gpt-oss
     --make-vocab-size-divisible-by 128
-    --data-path "$SFT_DATA_PATH"
     --data-cache-path "$RUN_DIR/data_cache"
-    --split 100,0,0
     --no-create-attention-mask-in-dataloader
     --num-workers 0
 )
+if [[ -d "$SFT_DATA_PATH" ]]; then
+    SFT_TRAIN_DATA_PATH="$SFT_DATA_PATH/train-00000.parquet"
+    SFT_VALID_DATA_PATH="$SFT_DATA_PATH/val-00000.parquet"
+    if [[ ! -f "$SFT_TRAIN_DATA_PATH" || ! -f "$SFT_VALID_DATA_PATH" ]]; then
+        echo "SFT Parquet directory must contain train-00000.parquet and val-00000.parquet" >&2
+        exit 1
+    fi
+    DATA_ARGS+=(
+        --train-data-path "$SFT_TRAIN_DATA_PATH"
+        --valid-data-path "$SFT_VALID_DATA_PATH"
+    )
+else
+    DATA_ARGS+=(--data-path "$SFT_DATA_PATH" --split 100,0,0)
+fi
 
 CHECKPOINT_ARGS=(
     --load "$PHASE1_CHECKPOINT_DIR"

@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
-import atexit, json
+import atexit
+import json
 from collections import Counter
 from typing import Any, Dict, Optional
 
@@ -15,12 +16,16 @@ IGNORE_INDEX = -100
 
 
 class SFTLowLevelDataset:
-    """The low-level dataset loading jsonl data for SFT
+    """Load conversation JSONL or pretokenized Parquet data for SFT.
 
     Args:
-        dataset_path (str): The path to jsonl data
-            Each line of the jsonl must have key "messages" (List[Dict]),
-            which is a sequence of system/user/assistant messages.
+        dataset_path (str): The path to JSONL conversation data or pretokenized Parquet data.
+            Parquet files must contain ``input_ids``, ``loss_mask``, and ``length`` columns.
+            The stored mask is validated against targets reconstructed by the configured SFT
+            tokenizer; token IDs are not decoded and re-tokenized.
+
+            JSONL data must contain a ``messages`` key (List[Dict]), which is a sequence of
+            system/user/assistant messages.
             Must be in the following format:
             [
                 {"role": "system", "content": "something"},
@@ -37,13 +42,25 @@ class SFTLowLevelDataset:
             from datasets import load_dataset
         except ImportError:
             raise ImportError("SFTDataset currently requires datasets library to be installed")
-        self.dataset = load_dataset("json", data_files=dataset_path, split="all")
+        self.is_pretokenized = dataset_path.lower().endswith(".parquet")
+        dataset_format = "parquet" if self.is_pretokenized else "json"
+        self.dataset = load_dataset(dataset_format, data_files=dataset_path, split="all")
+        required_columns = (
+            {"input_ids", "loss_mask", "length"} if self.is_pretokenized else {"messages"}
+        )
+        missing_columns = required_columns - set(self.dataset.column_names)
+        if missing_columns:
+            raise ValueError(
+                f"SFT {dataset_format} data at {dataset_path!r} is missing required columns: "
+                f"{sorted(missing_columns)}"
+            )
 
     def __len__(self) -> int:
         return len(self.dataset)
 
-    def __getitem__(self, idx: int) -> list:
-        return self.dataset[idx]["messages"]
+    def __getitem__(self, idx: int) -> list | dict:
+        row = self.dataset[idx]
+        return row if self.is_pretokenized else row["messages"]
 
 
 class SFTDataset(MegatronDataset):
@@ -86,13 +103,49 @@ class SFTDataset(MegatronDataset):
             split_conversations.append(current)
         return split_conversations
 
+    @staticmethod
+    def _prepare_pretokenized_record(record, tokenizer):
+        tokens = np.asarray(record["input_ids"], dtype=np.int64)
+        provided_loss_mask = np.asarray(record["loss_mask"])
+        if tokens.ndim != 1 or provided_loss_mask.ndim != 1:
+            raise ValueError("Pretokenized SFT input_ids and loss_mask must be one-dimensional.")
+        if len(tokens) < 2:
+            raise ValueError("Pretokenized SFT records must contain at least two token IDs.")
+        if len(tokens) != len(provided_loss_mask):
+            raise ValueError(
+                "Pretokenized SFT input_ids and loss_mask lengths differ: "
+                f"{len(tokens)} != {len(provided_loss_mask)}."
+            )
+        if int(record["length"]) != len(tokens):
+            raise ValueError(
+                "Pretokenized SFT length metadata does not match input_ids: "
+                f"{record['length']} != {len(tokens)}."
+            )
+        if not np.isin(provided_loss_mask, (0, 1)).all():
+            raise ValueError("Pretokenized SFT loss_mask must contain only zero and one values.")
+        if tokens.min() < 0 or tokens.max() >= tokenizer.vocab_size:
+            raise ValueError(
+                "Pretokenized SFT token IDs fall outside the configured tokenizer vocabulary: "
+                f"range=[{tokens.min()}, {tokens.max()}], vocab_size={tokenizer.vocab_size}."
+            )
+
+        targets = tokenizer.build_targets_from_token_ids(tokens)
+        canonical_loss_mask = targets != IGNORE_INDEX
+        missing_targets = canonical_loss_mask & ~provided_loss_mask.astype(bool)
+        if missing_targets.any():
+            raise ValueError(
+                "Pretokenized SFT loss_mask excludes "
+                f"{int(missing_targets.sum())} canonical assistant targets."
+            )
+        return tokens, targets
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
 
         tokenizer = self.config.tokenizer
         pack_length = self.config.sequence_length
 
-        merged_conversations = self.dataset[int(self.indices[idx % len(self.indices)])]
-        split_conversations = self._split_conversations(merged_conversations)
+        record = self.dataset[int(self.indices[idx % len(self.indices)])]
+        records = [record] if isinstance(record, dict) else self._split_conversations(record)
 
         def extend_with_padding(tokens, targets, positions, real_token_mask, pad_len):
             tokens.extend([pad] * pad_len)
@@ -105,14 +158,16 @@ class SFTDataset(MegatronDataset):
         pack_positions = []
         pack_real_token_mask = []
         cu_seqlens = [0]
-        eod = tokenizer.eod
         pad = tokenizer.pad
         # TODO(duncan): Track number of convs dropped and/or truncated and amount of end-padding
-        for conversation in split_conversations:
+        for record in records:
 
-            tokens, targets = tokenizer.tokenize_conversation(
-                conversation, return_target=True, add_generation_prompt=False
-            )
+            if isinstance(record, dict):
+                tokens, targets = self._prepare_pretokenized_record(record, tokenizer)
+            else:
+                tokens, targets = tokenizer.tokenize_conversation(
+                    record, return_target=True, add_generation_prompt=False
+                )
 
             tokens_list = tokens.tolist()
             targets_list = targets.tolist()
@@ -141,13 +196,9 @@ class SFTDataset(MegatronDataset):
             # Handle any necessary truncation
             if len(pack_tokens) >= pack_length + 1:  # +1 here to account for later alignment
                 # Truncate on the right
-                max_body = pack_length
-                pack_tokens = pack_tokens[:max_body]
-                pack_targets = pack_targets[:max_body]
-                pack_real_token_mask = pack_real_token_mask[:max_body]
-                pack_tokens.append(pad)
-                pack_targets.append(pad)
-                pack_real_token_mask.append(False)
+                pack_tokens = pack_tokens[: pack_length + 1]
+                pack_targets = pack_targets[: pack_length + 1]
+                pack_real_token_mask = pack_real_token_mask[: pack_length + 1]
                 pack_positions = pack_positions[: pack_length + 1]
                 # Note len({pack_tokens, pack_targets, pack_positions}) should be pack_length + 1
                 cu_seqlens[-1] = len(pack_tokens) - 1

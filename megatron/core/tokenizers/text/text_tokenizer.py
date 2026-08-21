@@ -146,6 +146,12 @@ class MegatronTokenizerText(MegatronTokenizerBase):
         else:
             raise NotImplementedError("This method is supported only for SFTTokenizer.")
 
+    def build_targets_from_token_ids(self, tokens):
+        """Build assistant-only targets for an already-tokenized SFT sequence."""
+        if self.library == 'sft':
+            return self._tokenizer.build_targets_from_token_ids(tokens)
+        raise NotImplementedError("This method is supported only for SFTTokenizer.")
+
     def save_pretrained(self, path: str) -> None:
         """
         Saves HF tokenizer files.

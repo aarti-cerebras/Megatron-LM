@@ -184,6 +184,24 @@ class SFTTokenizer:
             raise ValueError("GPT-OSS SFT conversation contains no rendered assistant blocks.")
         return target
 
+    def build_targets_from_token_ids(self, tokens: np.ndarray) -> np.ndarray:
+        """Build assistant-only targets for an already-tokenized SFT sequence.
+
+        Args:
+            tokens: One-dimensional token IDs rendered with this tokenizer's prompt format.
+
+        Returns:
+            Target token IDs with non-target positions replaced by ``IGNORE_INDEX``.
+        """
+        tokens = np.asarray(tokens, dtype=np.int64)
+        if tokens.ndim != 1:
+            raise ValueError(f"Expected one-dimensional SFT token IDs, got shape {tokens.shape}.")
+        if self._prompt_format != "gpt-oss":
+            raise NotImplementedError(
+                "Pretokenized SFT target reconstruction currently supports only gpt-oss."
+            )
+        return self._mask_gpt_oss_assistant_targets(tokens)
+
     @staticmethod
     def _extract_token_ids(result) -> np.ndarray:
         if isinstance(result, dict) or hasattr(result, "input_ids"):

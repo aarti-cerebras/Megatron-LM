@@ -10,7 +10,7 @@ import torch
 
 from megatron.core.tokenizers.text.libraries.sft_tokenizer import IGNORE_INDEX, SFTTokenizer
 from megatron.core.utils import _get_batch_on_this_cp_rank_per_document_balancing
-from megatron.training.datasets.sft_dataset import SFTDataset
+from megatron.training.datasets.sft_dataset import SFTDataset, SFTLowLevelDataset
 
 
 class _DatasetTokenizer:
@@ -27,6 +27,37 @@ class _DatasetTokenizer:
         tokens = np.array([10, 99, 12, 99, 13], dtype=np.int64)
         targets = np.array([IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX, 99, 13], dtype=np.int64)
         return tokens, targets
+
+
+class _PretokenizedTokenizer:
+    pad = 99
+    eod = 98
+    vocab_size = 128
+
+    @staticmethod
+    def build_targets_from_token_ids(tokens):
+        targets = np.full_like(tokens, IGNORE_INDEX)
+        targets[3:] = tokens[3:]
+        return targets
+
+
+class _AllTargetTokenizer:
+    pad = 99
+    eod = 98
+
+    @staticmethod
+    def tokenize_conversation(conversation, return_target, add_generation_prompt):
+        assert conversation[0]["role"] == "system"
+        assert return_target is True
+        assert add_generation_prompt is False
+        tokens = np.array([10, 11, 12, 13, 14, 15], dtype=np.int64)
+        return tokens, tokens.copy()
+
+
+class _Rows(list):
+    def __init__(self, rows, column_names):
+        super().__init__(rows)
+        self.column_names = column_names
 
 
 class _HarmonyTokenizer:
@@ -89,6 +120,97 @@ def test_sft_dataset_tracks_real_tokens_from_provenance():
     assert sample["loss_mask"][2].item() == 1.0
     assert sample["labels"][4].item() == _DatasetTokenizer.pad
     assert sample["loss_mask"][4].item() == 0.0
+
+
+def test_sft_low_level_dataset_loads_pretokenized_parquet():
+    rows = _Rows(
+        [{"input_ids": [10, 11], "loss_mask": [0, 1], "length": 2}],
+        ["input_ids", "loss_mask", "length"],
+    )
+    with patch("datasets.load_dataset", return_value=rows) as load_dataset:
+        dataset = SFTLowLevelDataset("train-00000.parquet")
+
+    load_dataset.assert_called_once_with("parquet", data_files="train-00000.parquet", split="all")
+    assert dataset.is_pretokenized
+    assert dataset[0] == rows[0]
+
+
+def test_sft_low_level_dataset_rejects_incomplete_parquet_schema():
+    rows = _Rows([{"input_ids": [10, 11], "length": 2}], ["input_ids", "length"])
+    with (
+        patch("datasets.load_dataset", return_value=rows),
+        pytest.raises(ValueError, match="loss_mask"),
+    ):
+        SFTLowLevelDataset("train-00000.parquet")
+
+
+def test_sft_dataset_consumes_pretokenized_tokens_without_retokenizing():
+    dataset = SFTDataset.__new__(SFTDataset)
+    dataset.dataset = [
+        {
+            "input_ids": [10, 11, 12, 13, 14, 15],
+            # The source also supervises one generated assistant-header token. Canonical
+            # GPT-OSS reconstruction below intentionally keeps payloads and terminators only.
+            "loss_mask": [0, 0, 1, 1, 1, 1],
+            "length": 6,
+        }
+    ]
+    dataset.indices = np.array([0], dtype=np.int64)
+    dataset.config = SimpleNamespace(
+        tokenizer=_PretokenizedTokenizer(),
+        sequence_length=8,
+        reset_position_ids=False,
+        context_parallel_size=1,
+        create_attention_mask=False,
+        reset_attention_mask=False,
+    )
+
+    sample = dataset[0]
+
+    torch.testing.assert_close(sample["tokens"], torch.tensor([10, 11, 12, 13, 14, 15, 99, 99]))
+    torch.testing.assert_close(
+        sample["labels"], torch.tensor([IGNORE_INDEX, IGNORE_INDEX, 13, 14, 15, 99, 99, 99])
+    )
+    torch.testing.assert_close(
+        sample["loss_mask"], torch.tensor([0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0])
+    )
+    torch.testing.assert_close(
+        sample["real_token_mask"], torch.tensor([True, True, True, True, True, True, False, False])
+    )
+    assert sample["cu_seqlens"][:2].tolist() == [0, 8]
+
+
+def test_sft_dataset_rejects_parquet_mask_missing_canonical_targets():
+    record = {"input_ids": [10, 11, 12, 13, 14, 15], "loss_mask": [0, 0, 1, 1, 0, 1], "length": 6}
+    with pytest.raises(ValueError, match="excludes 1 canonical assistant targets"):
+        SFTDataset._prepare_pretokenized_record(record, _PretokenizedTokenizer())
+
+
+def test_sft_dataset_truncation_preserves_the_next_token_target():
+    dataset = SFTDataset.__new__(SFTDataset)
+    dataset.dataset = [
+        [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "prompt"},
+            {"role": "assistant", "content": "answer"},
+        ]
+    ]
+    dataset.indices = np.array([0], dtype=np.int64)
+    dataset.config = SimpleNamespace(
+        tokenizer=_AllTargetTokenizer(),
+        sequence_length=4,
+        reset_position_ids=False,
+        context_parallel_size=1,
+        create_attention_mask=False,
+        reset_attention_mask=False,
+    )
+
+    sample = dataset[0]
+
+    torch.testing.assert_close(sample["tokens"], torch.tensor([10, 11, 12, 13]))
+    torch.testing.assert_close(sample["labels"], torch.tensor([11, 12, 13, 14]))
+    torch.testing.assert_close(sample["loss_mask"], torch.ones(4))
+    torch.testing.assert_close(sample["real_token_mask"], torch.ones(4, dtype=torch.bool))
 
 
 def test_gpt_oss_masks_non_assistant_blocks_and_keeps_all_assistant_channels():
