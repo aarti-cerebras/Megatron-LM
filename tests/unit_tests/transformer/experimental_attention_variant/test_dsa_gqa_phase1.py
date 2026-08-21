@@ -10,6 +10,12 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
     get_dsa_layer_pattern,
     get_transformer_layer_with_experimental_attention_variant_spec,
 )
+from megatron.core.optimizer import (
+    OptimizerConfig,
+    _get_param_groups,
+    get_standard_config_overrides,
+)
+from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossLoggingHelper,
@@ -22,6 +28,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.training.checkpointing import _validate_dsa_phase1_checkpoint_mismatch
+from tests.unit_tests.test_utilities import Utils
 
 
 class _FakeBackend:
@@ -45,6 +52,30 @@ class _FakeBackend:
 
     def activation_func(self):
         return None
+
+
+class _PhaseTransitionModel(torch.nn.Module):
+    """Small DSA-shaped module tree for the distributed phase-transition contract."""
+
+    def __init__(self, evaluation_topk):
+        super().__init__()
+        self.external_input_norm = torch.nn.LayerNorm(8)
+        self.linear_qkv = torch.nn.Linear(8, 8, bias=True)
+        self.dense_delegate = torch.nn.Module()
+        self.dense_delegate.register_parameter("softmax_offset", torch.nn.Parameter(torch.zeros(2)))
+        self.linear_proj = torch.nn.Linear(8, 8, bias=True)
+        self.indexer = torch.nn.Linear(8, 8, bias=False)
+        for parameter in self.indexer.parameters():
+            parameter.is_dsa_indexer_parameter = True
+        # Evaluation top-K changes execution only and must never alter checkpoint structure.
+        self.evaluation_topk = evaluation_topk
+
+    def forward(self, inputs):
+        hidden = self.external_input_norm(inputs)
+        hidden = torch.tanh(self.linear_qkv(hidden))
+        sink = self.dense_delegate.softmax_offset.mean()
+        hidden = self.linear_proj(hidden) + sink
+        return hidden + self.indexer(hidden)
 
 
 def _dsa_gqa_config(**overrides):
@@ -314,6 +345,14 @@ def test_dsa_gqa_phase1_spec_uses_standard_attention_and_external_norm():
     assert spec.submodules.core_attention.submodules.dense_attention is torch.nn.Module
 
 
+def test_dsa_gqa_phase1_accepts_bias_enabled_gpt_oss_backbone():
+    config = _dsa_gqa_config(add_bias_linear=True)
+    spec = get_dsa_gqa_module_spec_for_backend(config, backend=_FakeBackend())
+
+    assert config.add_bias_linear
+    assert spec.module is SelfAttention
+
+
 def test_dsa_gqa_layer_spec_retargets_dense_checkpoint_keys():
     config = _dsa_gqa_config(dsa_layer_freq=1, window_size=None, window_attn_skip_freq=None)
 
@@ -403,6 +442,145 @@ def test_dsa_phase1_checkpoint_validation_rejects_backbone_mismatch(
         _validate_dsa_phase1_checkpoint_mismatch(
             absent_model_keys, unused_checkpoint_keys, "test checkpoint"
         )
+
+
+@pytest.mark.parametrize(
+    "bias_key",
+    [
+        "decoder.layers.1.self_attention.linear_qkv.bias",
+        "decoder.layers.1.self_attention.linear_proj.bias",
+    ],
+)
+def test_dsa_phase1_checkpoint_validation_rejects_unused_attention_bias(bias_key):
+    with pytest.raises(RuntimeError, match="partially loaded backbone"):
+        _validate_dsa_phase1_checkpoint_mismatch(set(), {bias_key}, "test checkpoint")
+
+
+def test_dsa_phase1_to_phase2_transition_rebuilds_joint_optimizer_and_scheduler():
+    Utils.initialize_model_parallel()
+    try:
+        assert torch.distributed.is_initialized()
+        torch.manual_seed(1234)
+
+        phase1_model = _PhaseTransitionModel(evaluation_topk=8).cuda()
+        for parameter in phase1_model.parameters():
+            parameter.requires_grad = getattr(parameter, "is_dsa_indexer_parameter", False)
+
+        phase1_indexer_parameters = [
+            parameter for parameter in phase1_model.parameters() if parameter.requires_grad
+        ]
+        phase1_optimizer = torch.optim.AdamW(phase1_indexer_parameters, lr=1.0e-4)
+        phase1_loss = phase1_model(torch.randn(4, 8, device="cuda")).square().mean()
+        phase1_loss.backward()
+        phase1_optimizer.step()
+        assert phase1_optimizer.state_dict()["state"]
+
+        saved_model_state = {
+            key: value.detach().clone() for key, value in phase1_model.state_dict().items()
+        }
+        phase1_state_keys = set(saved_model_state)
+
+        phase2_model = _PhaseTransitionModel(evaluation_topk=4).cuda()
+        assert set(phase2_model.state_dict()) == phase1_state_keys
+        load_result = phase2_model.load_state_dict(saved_model_state, strict=True)
+        assert not load_result.missing_keys
+        assert not load_result.unexpected_keys
+        assert phase2_model.evaluation_topk != phase1_model.evaluation_topk
+        assert set(phase2_model.state_dict()) == phase1_state_keys
+
+        optimizer_config = OptimizerConfig(
+            optimizer="adam",
+            lr=1.0e-5,
+            min_lr=1.0e-6,
+            dsa_indexer_lr=1.0e-4,
+            dsa_indexer_min_lr=1.0e-5,
+            weight_decay=0.0,
+        )
+        param_groups = _get_param_groups(
+            [phase2_model], optimizer_config, get_standard_config_overrides(optimizer_config)
+        )
+
+        grouped_parameters = [parameter for group in param_groups for parameter in group["params"]]
+        trainable_parameters = list(phase2_model.parameters())
+        assert len(grouped_parameters) == len(trainable_parameters)
+        assert len({id(parameter) for parameter in grouped_parameters}) == len(trainable_parameters)
+        assert {id(parameter) for parameter in grouped_parameters} == {
+            id(parameter) for parameter in trainable_parameters
+        }
+
+        indexer_groups = [
+            group
+            for group in param_groups
+            if any(
+                getattr(parameter, "is_dsa_indexer_parameter", False)
+                for parameter in group["params"]
+            )
+        ]
+        base_groups = [
+            group
+            for group in param_groups
+            if group["params"]
+            and not any(
+                getattr(parameter, "is_dsa_indexer_parameter", False)
+                for parameter in group["params"]
+            )
+        ]
+        assert indexer_groups and base_groups
+        assert all(group["max_lr"] == 1.0e-4 for group in indexer_groups)
+        assert all(group["min_lr"] == 1.0e-5 for group in indexer_groups)
+        assert all(group["max_lr"] == 1.0e-5 for group in base_groups)
+        assert all(group["min_lr"] == 1.0e-6 for group in base_groups)
+
+        phase2_optimizer = torch.optim.AdamW(param_groups, lr=optimizer_config.lr)
+        assert not phase2_optimizer.state
+        phase2_scheduler = OptimizerParamScheduler(
+            optimizer=phase2_optimizer,
+            init_lr=0.0,
+            max_lr=optimizer_config.lr,
+            min_lr=optimizer_config.min_lr,
+            lr_warmup_steps=2,
+            lr_decay_steps=10,
+            lr_decay_style="cosine",
+            start_wd=0.0,
+            end_wd=0.0,
+            wd_incr_steps=10,
+            wd_incr_style="constant",
+            use_checkpoint_opt_param_scheduler=False,
+        )
+        assert phase2_scheduler.num_steps == 0
+        phase2_scheduler.step(2)
+        assert all(group["lr"] == pytest.approx(group["max_lr"]) for group in param_groups)
+
+        phase2_optimizer.zero_grad()
+        phase2_loss = phase2_model(torch.randn(4, 8, device="cuda")).square().mean()
+        phase2_loss.backward()
+        base_grad_norm = torch.stack(
+            [
+                parameter.grad.float().norm()
+                for parameter in phase2_model.parameters()
+                if not getattr(parameter, "is_dsa_indexer_parameter", False)
+            ]
+        ).norm()
+        indexer_grad_norm = torch.stack(
+            [
+                parameter.grad.float().norm()
+                for parameter in phase2_model.parameters()
+                if getattr(parameter, "is_dsa_indexer_parameter", False)
+            ]
+        ).norm()
+        transition_health = torch.tensor(
+            [
+                torch.isfinite(phase2_loss) and phase2_loss != 0,
+                torch.isfinite(base_grad_norm) and base_grad_norm != 0,
+                torch.isfinite(indexer_grad_norm) and indexer_grad_norm != 0,
+            ],
+            device="cuda",
+            dtype=torch.int32,
+        )
+        torch.distributed.all_reduce(transition_health, op=torch.distributed.ReduceOp.MIN)
+        assert transition_health.tolist() == [1, 1, 1]
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def test_dsa_layer_integer_pattern_selects_every_nth_layer():

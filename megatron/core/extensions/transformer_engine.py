@@ -2176,6 +2176,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         self.kept_packed_seq_params.discard("seq_idx")
         self.kept_packed_seq_params.discard("tokens_per_sample")
         self.kept_packed_seq_params.discard("cp_scatter_cache")
+        # MCore DSA consumes this provenance mask directly from PackedSeqParams. It is not part
+        # of Transformer Engine's DotProductAttention API and must not reach ordinary dense or
+        # sliding-window attention layers in a mixed DSA model.
+        self.kept_packed_seq_params.discard("real_token_mask_q")
 
         if get_te_version() < PkgVersion("2.2.0"):
             self.kept_packed_seq_params.discard("pad_between_seqs")

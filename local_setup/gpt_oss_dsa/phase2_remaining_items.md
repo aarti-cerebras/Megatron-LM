@@ -2,22 +2,26 @@
 
 **Audit date:** 2026-08-21
 **Branch inspected:** `aarti/gpt-oss-dsa`
-**HEAD inspected:** `1de90b5a1` (`Add sink-aware GQA sparse attention`)
+**HEAD inspected:** `7aeefd9eb` (`Add real-token masking for GPT-OSS DSA SFT`)
 
 ## Summary
 
-Phase 2 is not yet runnable end to end. Workstream A, sink-aware GQA sparse attention, is committed.
-Workstream B is implemented in the working tree and its full focused suite passes under the
-repository container on 8 H100s with the installed native GPT-OSS tokenizer. Helper-only reduction
-assertions, prompt-gradient coverage, native-tokenizer edge cases, and distributed-optimizer/
-Megatron-FSDP coverage still need stronger integration tests. A bias-correct trained Phase 1
-checkpoint, the Phase 1-to-Phase 2 transition, Phase 2 diagnostics, launch recipes, functional
-coverage, real SFT data, and rollout validation remain open.
+Phase 2 is not yet runnable end to end. Workstream A, sink-aware GQA sparse attention, and
+Workstream B, SFT real-token provenance and assistant-only supervision, are committed. Their full
+focused suites pass under the repository container on 8 H100s with the installed native GPT-OSS
+tokenizer. GPT-OSS attention-bias fidelity is resolved, and a bias-correct 100-step Phase 1
+checkpoint containing trained indexer state is available. Helper-only reduction assertions,
+prompt-gradient coverage, native-tokenizer edge cases, and distributed-optimizer/Megatron-FSDP
+coverage still need stronger integration tests. The Phase 1-to-Phase 2 transition now passes on the
+full 20B model: the actual iteration-100 checkpoint loads model-only, a fresh joint optimizer and
+schedule run two native-Harmony SFT steps with finite base/indexer gradients, and the resulting
+Phase 2 checkpoint saves successfully. Reproducible Phase 2 train/run/validate launchers are now
+available. Phase 2 diagnostics, functional coverage, real SFT data, and rollout validation remain
+open.
 
-The highest-priority issue is model fidelity: the converted GPT-OSS checkpoint contains attention
-projection biases, but the current Phase 1 launcher passes `--disable-bias-linear`. A Phase 1
-checkpoint produced through that path is not suitable as the starting point for a real Phase 2
-fine-tune until the bias contract is resolved and validated.
+The highest-priority dependency is now preparing and validating the real conversation SFT dataset,
+then running Gate B for 20 steps with the new Phase 2 recipe. That run must exercise realistic data
+variation, confirm stable base/indexer gradient balance, and provide the remaining diagnostics.
 
 ## Current state
 
@@ -31,6 +35,11 @@ fine-tune until the bias contract is resolved and validated.
 - [x] Implement a CP-global DSA real-query denominator independent of the LM loss denominator.
 - [x] Implement a dedicated `gpt-oss` assistant-target parser using Harmony boundaries.
 - [x] Add CPU-level provenance, padding-invariance, reduction, and synthetic Harmony parser tests.
+- [x] Preserve GPT-OSS Q/K/V/output and expert projection biases in the Phase 1 launcher.
+- [x] Save a bias-correct 100-step Phase 1 checkpoint containing trained indexer state.
+- [x] Strictly transition that checkpoint into the full 20B Phase 2 SFT model and run joint
+  base/indexer optimization.
+- [x] Add reproducible Phase 2 SFT train, run, and validation launchers.
 
 ### Completed validation
 
@@ -52,29 +61,43 @@ Validation record (2026-08-21):
 
 ## Remaining items
 
-### 1. Resolve GPT-OSS attention-bias fidelity
+### 1. GPT-OSS attention-bias fidelity (resolved)
 
-The README records `attention_bias: true` as an open question. Current artifacts make the mismatch
-concrete:
+The prior README recorded `attention_bias: true` as an open question. The original artifacts made
+the mismatch concrete:
 
 - ModelOpt conversion built bias-enabled attention projections.
-- `local_setup/train_gpt_oss_20b_dsa_phase1.sh` passes `--disable-bias-linear`.
-- The Phase 1 training log therefore reports `add_bias_linear=False` and `add_qkv_bias=False` when
-  loading a checkpoint converted with those values enabled.
+- The original `local_setup/train_gpt_oss_20b_dsa_phase1.sh` passed `--disable-bias-linear`.
+- The original Phase 1 training log therefore reported `add_bias_linear=False` and
+  `add_qkv_bias=False` when loading a checkpoint converted with those values enabled.
 
 Required work:
 
-- [ ] Remove or replace `--disable-bias-linear` with the configuration matching the converted HF
+- [x] Remove or replace `--disable-bias-linear` with the configuration matching the converted HF
   checkpoint.
-- [ ] Verify Q/K/V/output projection biases load and round-trip without missing or unexpected keys.
-- [ ] Add a regression test that prevents a converted GPT-OSS checkpoint from silently dropping its
+- [x] Verify Q/K/V/output projection biases load and round-trip without missing or unexpected keys.
+- [x] Add a regression test that prevents a converted GPT-OSS checkpoint from silently dropping its
   trained attention biases.
-- [ ] Re-run Phase 1 from the bias-correct checkpoint.
-- [ ] Save an actual trained Phase 1 checkpoint containing the indexer state.
+- [x] Re-run Phase 1 from the bias-correct checkpoint.
+- [x] Save an actual trained Phase 1 checkpoint containing the indexer state.
 
-The artifact store currently contains the converted release checkpoint, but no saved checkpoint
-from the successful 100-step Phase 1 run. The latest 4K/10K attempt failed from GPU OOM while the
-shared host had insufficient free device memory, so it must be rerun on sufficiently free GPUs.
+Validation record (2026-08-21):
+
+- The launcher now leaves Megatron's `add_bias_linear=True` default enabled; argument validation
+  also sets `add_qkv_bias=True`. `--no-bias-dropout-fusion` remains set for grouped-GEMM bias
+  compatibility.
+- The focused Phase 1 test file passed on every rank under an 8-GPU distributed invocation:
+  `42 passed` per rank. It explicitly accepts bias-enabled DSA-GQA and rejects unused
+  `linear_qkv.bias` or `linear_proj.bias` checkpoint keys.
+- A one-step load/save from the ModelOpt release checkpoint and a second load from that saved
+  checkpoint both exited zero with bias enabled. The reload had no incompatible-key report.
+- The bias-correct 100-step run completed with zero skipped and zero NaN iterations. Indexer KL
+  fell from `4.692320` at step 1 to `0.101674` at step 100; top-K recall reached `0.905476`, and
+  attention-score recall reached `0.968656`.
+- The trained checkpoint tracker records iteration 100 at:
+  `/cb/ml-eng/aarti/mcore_runs/gptoss20b_dsa_phase1_bias_correct_100step_20260821T005100Z/checkpoints`.
+  Its distributed metadata contains both `linear_qkv.bias` and `linear_proj.bias` keys as well as
+  the trained DSA indexer state.
 
 ### 2. Complete Workstream B validation
 
@@ -124,25 +147,51 @@ is image-owned and the host UID cannot rewrite it.
 
 Model-state requirements:
 
-- [ ] Build Phase 1 and Phase 2 with identical module trees and state-dict key sets.
-- [ ] Strictly load a saved Phase 1 checkpoint into Phase 2 with no missing or unexpected keys.
-- [ ] Include indexer state, external input normalization, Q/K/V/output weights and biases, and the
+- [x] Build Phase 1 and Phase 2 with identical module trees and state-dict key sets.
+- [x] Strictly load a saved Phase 1 checkpoint into Phase 2 with no missing or unexpected keys.
+- [x] Include indexer state, external input normalization, Q/K/V/output weights and biases, and the
   dense delegate's `softmax_offset`.
-- [ ] Verify changing evaluation top-K does not change the state-dict structure.
+- [x] Verify changing evaluation top-K does not change the state-dict structure.
 
 Optimizer and scheduler requirements:
 
-- [ ] Load Phase 1 as model weights only; do not restore the indexer-only optimizer state.
-- [ ] Rebuild the optimizer with both base and indexer parameters trainable.
-- [ ] Verify every trainable parameter appears in exactly one optimizer group.
-- [ ] Verify indexer groups use the DSA maximum/minimum LR endpoints.
-- [ ] Verify base groups use the base maximum/minimum LR endpoints.
-- [ ] Start a new Phase 2 warmup and decay schedule.
-- [ ] Verify finite, nonzero base and indexer gradients after one SFT backward pass.
-- [ ] Verify the expected base/indexer learning rates and gradient norms are logged.
+- [x] Load Phase 1 as model weights only; do not restore the indexer-only optimizer state.
+- [x] Rebuild the optimizer with both base and indexer parameters trainable.
+- [x] Verify every trainable parameter appears in exactly one optimizer group.
+- [x] Verify indexer groups use the DSA maximum/minimum LR endpoints.
+- [x] Verify base groups use the base maximum/minimum LR endpoints.
+- [x] Start a new Phase 2 warmup and decay schedule.
+- [x] Verify finite, nonzero base and indexer gradients after one SFT backward pass.
+- [x] Verify the expected base/indexer learning rates and gradient norms are logged.
 
 This must be a distributed unit test. The ordinary functional checkpoint-resume test cannot model a
 transition in which the phase flags and optimizer population change.
+
+Distributed contract validation (2026-08-21):
+
+- `test_dsa_phase1_to_phase2_transition_rebuilds_joint_optimizer_and_scheduler` passed on every
+  rank under `torch.distributed.run --nproc-per-node 8` as part of the full focused Phase 1 file
+  (`42 passed` per rank).
+- The test strictly transfers the complete Phase 1 model state into an identical Phase 2 module
+  tree with a different evaluation top-K, discards the populated Phase 1 AdamW state, rebuilds
+  disjoint base/indexer groups with their independent LR endpoints, starts a fresh warmup, and
+  proves finite nonzero gradients on every rank.
+- The full 20B gate at
+  `/cb/ml-eng/aarti/mcore_runs/gptoss20b_dsa_phase2_sft_smoke_20260821T012127Z` then strictly
+  loaded the actual iteration-100 `torch_dist` checkpoint with `--finetune --no-load-optim
+  --no-load-rng` and completed two native-Harmony SFT optimizer steps on 8 H100s.
+- A follow-up no-save logging gate at
+  `/cb/ml-eng/aarti/mcore_runs/gptoss20b_dsa_phase2_sft_smoke_20260821T013826Z` fixed and validated
+  indexer-LR reporting under distributed-optimizer sharding. Step 1 logged base/indexer LRs
+  `1e-5`/`1e-4`, base/indexer gradient norms `272.402`/`159.479`, LM loss `3.291085`, indexer KL
+  `0.909339`, zero skipped iterations, and zero NaN iterations. Step 2 logged the configured
+  base/indexer minimum LRs `1e-6`/`1e-5` and remained finite.
+- Rank 0 peaked at `59,541.02` MB allocated and `59,636.00` MB reserved. The iteration-2 Phase 2
+  checkpoint, including the joint distributed optimizer state, saved successfully. Its eight data
+  shards total approximately 293 GB, and the save took about 9 minutes 40 seconds.
+- The live run exposed and fixed an integration bug in which MCore-only `real_token_mask_q`
+  provenance was forwarded into dense Transformer Engine attention. The focused regression passed
+  on all 8 ranks.
 
 ### 4. Add Phase 2 diagnostics
 
@@ -164,26 +213,30 @@ computed on diagnostic steps.
 
 Create:
 
-- [ ] `local_setup/train_gpt_oss_20b_dsa_phase2_sft.sh`
-- [ ] `local_setup/run_gpt_oss_20b_dsa_phase2_sft.sh`
-- [ ] `local_setup/validate_gpt_oss_20b_dsa_phase2_sft.sh`
+- [x] `local_setup/train_gpt_oss_20b_dsa_phase2_sft.sh`
+- [x] `local_setup/run_gpt_oss_20b_dsa_phase2_sft.sh`
+- [x] `local_setup/validate_gpt_oss_20b_dsa_phase2_sft.sh`
 
 Each run directory must record:
 
-- [ ] Resolved launch and training commands.
-- [ ] Source branch, commit, git status, and dirty-worktree patch.
-- [ ] Phase 1 checkpoint path and selected iteration.
-- [ ] Tokenizer and dataset paths.
-- [ ] Argument and environment metadata.
+- [x] Resolved launch and training commands.
+- [x] Source branch, commit, git status, and dirty-worktree patch.
+- [x] Phase 1 checkpoint path and selected iteration.
+- [x] Tokenizer and dataset paths.
+- [x] Argument and environment metadata.
 - [ ] Per-rank and combined logs.
-- [ ] TensorBoard output.
-- [ ] Final status and exit code.
-- [ ] Peak-memory and timing summaries.
+- [x] TensorBoard output.
+- [x] Final status and exit code.
+- [x] Peak-memory and timing summaries.
 
 The initial Phase 2 recipe must retain the Phase 1 model/indexer geometry, use sparse attention with
 `dsa_kernel_backend=none`, omit `dsa_dense_warmup` and `dsa_freeze_base`, retain full-support indexer
 KL, and consume SFT conversation JSONL through `SFTTokenizer` with the validated `gpt-oss` prompt
 format.
+
+The two-step smoke gate satisfies this recipe contract. Its bundled JSONL is intentionally synthetic
+and validates plumbing only; it does not satisfy the real-data requirements in section 6 or the
+20-step Gate B requirement in section 8.
 
 ### 6. Prepare real SFT data
 
@@ -243,15 +296,15 @@ SM90 remains unverified.
 
 `local_setup/README.md` contains two stale prerequisites:
 
-- [ ] Replace the statement that the GPT-OSS 20B safetensors are missing. The model directory now
+- [x] Replace the statement that the GPT-OSS 20B safetensors are missing. The model directory now
   contains the complete top-level safetensor checkpoint and index.
-- [ ] Replace or qualify the statement that conversion through Megatron-Bridge is still required.
-  A ModelOpt-converted MCore checkpoint exists, although the attention-bias mismatch must be fixed
-  before treating it as a fidelity-validated Phase 1 starting point.
+- [x] Replace or qualify the statement that conversion through Megatron-Bridge is still required.
+  A ModelOpt-converted MCore checkpoint exists, and its attention-bias fidelity is now validated by
+  the bias-correct Phase 1 load/save/reload runs.
 
-The README should state that the remaining real-finetune prerequisites are a bias-correct trained
-Phase 1 checkpoint, prepared conversation SFT data, the Phase 2 transition and recipes, and the
-validation gates above.
+The README should state that the remaining real-finetune prerequisites are prepared conversation
+SFT data, production diagnostics, a functional test, and the rollout gates above. The bias-correct
+Phase 1 checkpoint, live 20B transition, and initial Phase 2 launch recipes are now available.
 
 ## Separate later milestones
 

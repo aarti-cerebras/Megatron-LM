@@ -1,0 +1,1 @@
+{"messages":[{"role":"developer","content":"Answer clearly and briefly."},{"role":"user","content":"What is two plus two?"},{"role":"assistant","thinking":"Add the two integers.","content":"Four."}]}

@@ -103,6 +103,28 @@ class TestParallelAttentionWithPackedSequence:
         assert output.shape[2] == config.hidden_size
         assert bias.shape[0] == config.hidden_size
 
+    def test_gpu_forward_ignores_dsa_real_token_provenance(self):
+        """Dense TE attention must not receive MCore-only DSA packed metadata."""
+        sequence_length = 32
+        micro_batch_size = 1
+        self.parallel_attention.cuda()
+        hidden_states = torch.ones(
+            (sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        packed_seq_params = make_test_packed_seq_params(sequence_length)
+        packed_seq_params.real_token_mask_q = torch.ones(
+            (micro_batch_size, sequence_length), device="cuda", dtype=torch.bool
+        )
+
+        output, bias = self.parallel_attention(
+            hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+        )
+
+        assert output.shape == hidden_states.shape
+        assert bias.shape[0] == self.parallel_attention.config.hidden_size
+
     @pytest.mark.skipif(not is_te_min_version("1.4.0"), reason="Fused RoPE requires TE >= 1.4.0")
     def test_fused_rope_gpu_forward(self):
         self.parallel_attention.config.apply_rope_fusion = True

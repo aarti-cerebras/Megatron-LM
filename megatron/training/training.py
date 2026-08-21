@@ -2817,8 +2817,11 @@ def training_log(
     learning_rate: float | None = reduce_max_stat_across_model_parallel_group(
         learning_rate, group=_lr_mp_group
     )
+    # Distributed optimizer sharding can leave the logging rank without a local indexer shard,
+    # even though another data-parallel rank owns one. Every training rank follows this logging
+    # path, so reduce the indexer LR across the full job before emitting it.
     dsa_indexer_learning_rate = reduce_max_stat_across_model_parallel_group(
-        dsa_indexer_learning_rate, group=_lr_mp_group
+        dsa_indexer_learning_rate, group=torch.distributed.group.WORLD
     )
     if learning_rate is None and args.freeze_all_layers:
         learning_rate = 0.0
