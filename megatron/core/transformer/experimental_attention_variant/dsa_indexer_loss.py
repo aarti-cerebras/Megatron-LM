@@ -50,13 +50,19 @@ def reduce_indexer_kl_sum(
     num_rows: int,
     calculate_per_token_loss: bool,
     valid_row_count: Optional[torch.Tensor] = None,
+    normalization_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> torch.Tensor:
-    """Reduce an already-summed KL value using DSA token-loss semantics."""
+    """Reduce a local KL sum over the CP-global real-query denominator."""
     if calculate_per_token_loss:
         return kl_sum
-    if valid_row_count is not None:
-        return kl_sum / valid_row_count.to(dtype=torch.float32, device=kl_sum.device).clamp_min(1.0)
-    return kl_sum / max(num_rows, 1)
+    if valid_row_count is None:
+        valid_row_count = torch.tensor(num_rows, dtype=torch.float32, device=kl_sum.device)
+    else:
+        valid_row_count = valid_row_count.to(dtype=torch.float32, device=kl_sum.device)
+    valid_row_count = valid_row_count.detach().clone()
+    if normalization_group is not None:
+        torch.distributed.all_reduce(valid_row_count, group=normalization_group)
+    return kl_sum / valid_row_count.clamp_min(1.0)
 
 
 def indexer_loss_from_target(
@@ -66,6 +72,7 @@ def indexer_loss_from_target(
     query_valid_rows: Optional[torch.Tensor] = None,
     calculate_per_token_loss: bool = False,
     valid_mask: Optional[torch.Tensor] = None,
+    normalization_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> torch.Tensor:
     """Compute scaled DSA indexer KL loss from normalized target probabilities."""
     kl_per_row = indexer_kl_per_row(target, predict_log_probs, valid_mask)
@@ -79,5 +86,6 @@ def indexer_loss_from_target(
         num_rows=kl_per_row.numel(),
         calculate_per_token_loss=calculate_per_token_loss,
         valid_row_count=valid_row_count,
+        normalization_group=normalization_group,
     )
     return kl_div * loss_coeff

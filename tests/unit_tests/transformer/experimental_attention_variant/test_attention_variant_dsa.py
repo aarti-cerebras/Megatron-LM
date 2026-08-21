@@ -49,6 +49,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_masking import
     build_causal_mask_from_positions,
     build_dsattention_forward_mask,
     build_fused_indexer_varlen_bounds,
+    extract_query_valid_rows_from_packed_seq_params,
     generate_varlen_mask_params_for_positions,
     masked_log_softmax,
     scatter_topk_into_index_mask,
@@ -1532,6 +1533,64 @@ class TestDSAIndexerLossHelpersCPU:
         )
         torch.testing.assert_close(logits.grad, expected_grad)
 
+    def test_cp_unequal_real_row_counts_match_concatenated_reference(self):
+        local_kl_sums = [
+            torch.tensor(3.0, requires_grad=True),
+            torch.tensor(12.0, requires_grad=True),
+        ]
+        local_real_row_counts = [torch.tensor(2.0), torch.tensor(3.0)]
+        global_real_row_count = sum(count.item() for count in local_real_row_counts)
+
+        def set_global_count(count, group):
+            assert group is normalization_group
+            count.fill_(global_real_row_count)
+
+        normalization_group = object()
+        with patch("torch.distributed.all_reduce", side_effect=set_global_count):
+            local_losses = [
+                dsa_indexer_loss.reduce_indexer_kl_sum(
+                    kl_sum,
+                    num_rows=99,
+                    calculate_per_token_loss=False,
+                    valid_row_count=real_row_count,
+                    normalization_group=normalization_group,
+                )
+                for kl_sum, real_row_count in zip(local_kl_sums, local_real_row_counts)
+            ]
+
+        cp_global_loss = sum(local_losses)
+        concatenated_reference = sum(kl.item() for kl in local_kl_sums) / global_real_row_count
+        torch.testing.assert_close(cp_global_loss, torch.tensor(concatenated_reference))
+
+        cp_global_loss.backward()
+        for kl_sum in local_kl_sums:
+            torch.testing.assert_close(kl_sum.grad, torch.tensor(1.0 / global_real_row_count))
+
+    def test_cp_denominator_is_recomputed_for_each_gradient_accumulation_microbatch(self):
+        microbatch_kl_sums = [torch.tensor(8.0), torch.tensor(15.0)]
+        microbatch_global_real_rows = [4.0, 10.0]
+        normalization_group = object()
+
+        reduced_losses = []
+        for kl_sum, global_real_rows in zip(microbatch_kl_sums, microbatch_global_real_rows):
+            with patch(
+                "torch.distributed.all_reduce",
+                side_effect=lambda count, group, rows=global_real_rows: count.fill_(rows),
+            ):
+                reduced_losses.append(
+                    dsa_indexer_loss.reduce_indexer_kl_sum(
+                        kl_sum,
+                        num_rows=99,
+                        calculate_per_token_loss=False,
+                        valid_row_count=torch.tensor(1.0),
+                        normalization_group=normalization_group,
+                    )
+                )
+
+        # Auxiliary-loss scaling later applies the equal-microbatch average. The reducer must
+        # first produce an independently normalized CP-global mean for each microbatch.
+        torch.testing.assert_close(torch.stack(reduced_losses), torch.tensor([2.0, 1.5]))
+
 
 class TestDSAIndexerLossRowMaskCPU:
     """CPU tests for packed-row masking in DSA indexer loss."""
@@ -1557,15 +1616,30 @@ class TestDSAIndexerLossRowMaskCPU:
         torch.testing.assert_close(log_probs, torch.zeros_like(log_probs))
         assert torch.isfinite(log_probs).all()
 
+    def test_packed_sequence_real_token_mask_becomes_query_row_mask(self):
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            real_token_mask_q=torch.tensor([[True, True, False, False]]),
+        )
+
+        query_valid_rows = extract_query_valid_rows_from_packed_seq_params(
+            packed_seq_params, b=1, sq=4, device=torch.device("cpu")
+        )
+
+        torch.testing.assert_close(query_valid_rows, torch.tensor([[True, True, False, False]]))
+
     def test_dense_indexer_loss_ignores_padded_rows(self):
-        index_scores = torch.tensor([[[2.0, float("-inf")], [0.1, 0.9]]], dtype=torch.float32)
+        masked_index_scores = torch.tensor(
+            [[[2.0, 0.0], [0.1, 0.9]]], dtype=torch.float32, requires_grad=True
+        )
+        trimmed_index_scores = masked_index_scores[:, :1, :].detach().clone().requires_grad_()
         topk_indices = torch.tensor([[[0, 1], [1, 0]]], dtype=torch.int64)
         query = torch.tensor([[[[1.0, 0.0]]], [[[0.0, 1.0]]]], dtype=torch.float32)
         key = torch.tensor([[[[1.0, 0.0]]], [[[0.0, 1.0]]]], dtype=torch.float32)
-        mask = torch.tensor([[0.0, float("-inf")], [0.0, 0.0]], dtype=torch.float32)
+        mask = torch.zeros((2, 2), dtype=torch.float32)
 
         masked_loss = compute_dsa_indexer_loss(
-            index_scores=index_scores.clone(),
+            index_scores=masked_index_scores + 0.0,
             topk_indices=topk_indices,
             query=query,
             key=key,
@@ -1577,7 +1651,7 @@ class TestDSAIndexerLossRowMaskCPU:
             query_valid_rows=torch.tensor([True, False], dtype=torch.bool),
         )
         trimmed_loss = compute_dsa_indexer_loss(
-            index_scores=index_scores[:, :1, :].clone(),
+            index_scores=trimmed_index_scores + 0.0,
             topk_indices=topk_indices[:, :1, :].clone(),
             query=query[:1].clone(),
             key=key,
@@ -1589,6 +1663,42 @@ class TestDSAIndexerLossRowMaskCPU:
         )
 
         torch.testing.assert_close(masked_loss, trimmed_loss)
+        masked_loss.backward()
+        trimmed_loss.backward()
+        torch.testing.assert_close(masked_index_scores.grad[:, :1], trimmed_index_scores.grad)
+        torch.testing.assert_close(
+            masked_index_scores.grad[:, 1:], torch.zeros_like(masked_index_scores.grad[:, 1:])
+        )
+
+    def test_lm_supervision_mask_does_not_change_dsa_reduction(self):
+        target = torch.tensor([[[0.7, 0.3], [0.2, 0.8], [0.4, 0.6]]], dtype=torch.float32)
+        logits = torch.tensor(
+            [[[0.1, -0.2], [0.3, 0.4], [-0.5, 0.2]]],
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        query_valid_rows = torch.tensor([[True, True, False]])
+        prompt_only_lm_mask = torch.tensor([[0.0, 1.0, 0.0]])
+        all_real_lm_mask = torch.tensor([[1.0, 1.0, 0.0]])
+
+        losses = []
+        gradients = []
+        for lm_loss_mask in (prompt_only_lm_mask, all_real_lm_mask):
+            # The LM mask deliberately changes between calls. DSA consumes only the independent
+            # real-query mask, so its numerator, denominator, and gradients must remain unchanged.
+            assert lm_loss_mask.shape == query_valid_rows.shape
+            loss = dsa_indexer_loss.indexer_loss_from_target(
+                target,
+                torch.log_softmax(logits, dim=-1),
+                loss_coeff=1.0,
+                query_valid_rows=query_valid_rows,
+            )
+            gradient = torch.autograd.grad(loss, logits, retain_graph=True)[0]
+            losses.append(loss)
+            gradients.append(gradient)
+
+        torch.testing.assert_close(losses[0], losses[1])
+        torch.testing.assert_close(gradients[0], gradients[1])
 
     def test_sparse_indexer_loss_ignores_padded_rows(self):
         index_topk_scores = torch.tensor([[[2.0, float("-inf")], [0.9, 0.1]]], dtype=torch.float32)
@@ -2066,9 +2176,7 @@ class TestFusedDSAIndexerLossGradient:
         k = torch.randn(seqlen, batch_size, 8, device="cuda")
         query = torch.randn(seqlen, batch_size, 4, 8, dtype=torch.bfloat16, device="cuda")
         key = torch.randn(seqlen, batch_size, 2, 8, dtype=torch.bfloat16, device="cuda")
-        mask = torch.triu(
-            torch.full((seqlen, seqlen), float("-inf"), device="cuda"), diagonal=1
-        )
+        mask = torch.triu(torch.full((seqlen, seqlen), float("-inf"), device="cuda"), diagonal=1)
 
         results = []
         for block_size in (seqlen, 5):
@@ -2104,8 +2212,7 @@ class TestFusedDSAIndexerLossGradient:
             if block_size == 5:
                 assert grouped_scores.call_count > 1
                 assert all(
-                    call.args[0].size(0) <= block_size
-                    and call.args[1].size(0) <= block_size
+                    call.args[0].size(0) <= block_size and call.args[1].size(0) <= block_size
                     for call in grouped_scores.call_args_list
                 )
             results.append((topk_indices, loss, q_test.grad, weights_test.grad, k_test.grad))

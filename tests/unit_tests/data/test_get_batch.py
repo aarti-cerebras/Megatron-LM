@@ -15,6 +15,7 @@ from megatron.core.utils import (
 )
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
+from pretrain_gpt import get_batch as get_gpt_batch
 from pretrain_hybrid import get_batch
 from tests.unit_tests.test_utilities import Utils
 
@@ -151,6 +152,111 @@ def create_sft_data_iterator(max_seq_length: int = 1024):
         "max_seqlen": max_seqlen,
     }
     return iter([batch]), num_real_tokens
+
+
+def create_phase2_sft_data_iterator(seq_length: int, micro_batch_size: int):
+    """Create a deterministic Phase-2 SFT batch with prompt, assistant, and padding rows."""
+    tokens = torch.arange(micro_batch_size * seq_length, dtype=torch.int64).view(
+        micro_batch_size, seq_length
+    )
+    labels = tokens + 1
+    position_ids = torch.arange(seq_length, dtype=torch.int64).expand(micro_batch_size, -1).clone()
+
+    real_tokens_per_sample = 3 * seq_length // 4
+    real_token_mask = torch.zeros((micro_batch_size, seq_length), dtype=torch.bool)
+    real_token_mask[:, :real_tokens_per_sample] = True
+
+    # Supervise only an assistant subset. The real-token mask deliberately includes the prompt.
+    loss_mask = torch.zeros((micro_batch_size, seq_length), dtype=torch.float32)
+    loss_mask[:, seq_length // 4 : real_tokens_per_sample] = 1.0
+
+    # Two equal packed conversations per sample. Each length is divisible by 2 * CP for CP=2.
+    cu_seqlens = torch.tensor(
+        [[0, seq_length // 2, seq_length]] * micro_batch_size, dtype=torch.int32
+    )
+    max_seqlen = torch.full((micro_batch_size,), seq_length // 2, dtype=torch.int32)
+
+    batch = {
+        "tokens": tokens,
+        "labels": labels,
+        "loss_mask": loss_mask,
+        "position_ids": position_ids,
+        "real_token_mask": real_token_mask,
+        "cu_seqlens": cu_seqlens,
+        "max_seqlen": max_seqlen,
+    }
+    return iter([batch]), micro_batch_size * real_tokens_per_sample
+
+
+@pytest.mark.parametrize("tp_size,pp_size,cp_size", [(1, 4, 2), (2, 2, 2)])
+def test_gpt_phase2_sft_mask_plumbing_with_pp_cp_and_multi_microbatch(tp_size, pp_size, cp_size):
+    """Every TP rank and PP stage receives the CP-local mask for a flattened SFT batch."""
+    seq_length, micro_batch_size = 32, 2
+    required_world_size = tp_size * pp_size * cp_size
+    if required_world_size > torch.cuda.device_count():
+        pytest.skip(
+            f"Skipping test because TP={tp_size}, PP={pp_size}, and CP={cp_size} require "
+            f"{required_world_size} GPUs, got {torch.cuda.device_count()}."
+        )
+
+    dp_size = int(os.environ.get("WORLD_SIZE", 1)) // required_world_size
+    initialize_test_environment(
+        tp_size,
+        pp_size,
+        cp_size,
+        seq_length,
+        micro_batch_size,
+        global_batch_size=micro_batch_size * dp_size,
+        sft=True,
+    )
+
+    data_iterator = None
+    expected_real_token_count = micro_batch_size * (3 * seq_length // 4)
+    if mpu.get_tensor_model_parallel_rank() == 0:
+        data_iterator, iterator_real_token_count = create_phase2_sft_data_iterator(
+            seq_length, micro_batch_size
+        )
+        assert iterator_real_token_count == expected_real_token_count
+
+    (
+        attention_mask,
+        cu_seqlens,
+        cu_seqlens_padded,
+        hybrid_cp_group,
+        labels,
+        local_cp_size,
+        loss_mask,
+        max_seqlen,
+        position_ids,
+        real_token_mask,
+        tokens,
+    ) = get_gpt_batch(data_iterator)
+
+    assert attention_mask is None
+    assert cu_seqlens is not None
+    assert cu_seqlens_padded is None
+    assert hybrid_cp_group is None
+    assert local_cp_size is None
+    assert max_seqlen is not None
+    assert real_token_mask is not None
+    assert real_token_mask.dtype == torch.bool
+    assert real_token_mask.shape == (1, micro_batch_size * seq_length // cp_size)
+
+    cp_real_token_count = real_token_mask.sum(dtype=torch.int64)
+    torch.distributed.all_reduce(cp_real_token_count, group=mpu.get_context_parallel_group())
+    assert cp_real_token_count.item() == expected_real_token_count
+
+    if mpu.is_pipeline_first_stage():
+        assert tokens is not None and position_ids is not None
+        assert labels is None and loss_mask is None
+    elif mpu.is_pipeline_last_stage():
+        assert labels is not None and loss_mask is not None
+        assert tokens is None and position_ids is None
+    else:
+        assert tokens is None and labels is None
+        assert loss_mask is None and position_ids is None
+
+    Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
@@ -367,6 +473,7 @@ def test_flatten_batch_for_packed_sequences(micro_batch_size, seq_length):
         .expand(micro_batch_size, -1)
         .clone()
     )
+    real_token_mask = tokens.remainder(3) != 0
     half = seq_length // 2
     cu_seqlens = torch.tensor([[0, half, seq_length]] * micro_batch_size, dtype=torch.int32)
     max_seqlen = torch.tensor([half] * micro_batch_size, dtype=torch.int32)
@@ -376,6 +483,7 @@ def test_flatten_batch_for_packed_sequences(micro_batch_size, seq_length):
         'labels': labels,
         'loss_mask': loss_mask,
         'position_ids': position_ids,
+        'real_token_mask': real_token_mask,
         'cu_seqlens': cu_seqlens,
         'max_seqlen': max_seqlen,
     }
@@ -388,6 +496,8 @@ def test_flatten_batch_for_packed_sequences(micro_batch_size, seq_length):
     assert result['labels'].shape == (1, total_tokens)
     assert result['loss_mask'].shape == (1, total_tokens)
     assert result['position_ids'].shape == (1, total_tokens)
+    assert result['real_token_mask'].shape == (1, total_tokens)
+    torch.testing.assert_close(result['real_token_mask'], real_token_mask.reshape(1, -1))
 
     # cu_seqlens is 2-D (1, N), starts at 0, ends at total_tokens.
     assert result['cu_seqlens'].dim() == 2
@@ -643,12 +753,14 @@ def test_get_batch_on_this_cp_rank_per_sequence_balancing(cp_size, seq_length):
     simulated CP rank receives the expected zigzag-interleaved chunks.
     """
     tokens = torch.arange(seq_length, dtype=torch.int64).unsqueeze(0)
+    real_token_mask = tokens.remainder(3) != 0
     cu_seqlens = torch.tensor([[0, seq_length // 2, seq_length]], dtype=torch.int32)
     max_seqlen = torch.tensor([seq_length // 2], dtype=torch.int32)
 
     for cp_rank in range(cp_size):
         batch = {
             'tokens': tokens.clone(),
+            'real_token_mask': real_token_mask.clone(),
             'cu_seqlens': cu_seqlens.clone(),
             'max_seqlen': max_seqlen.clone(),
         }
@@ -662,6 +774,7 @@ def test_get_batch_on_this_cp_rank_per_sequence_balancing(cp_size, seq_length):
 
         if cp_size == 1:
             assert torch.equal(result['tokens'], tokens)
+            torch.testing.assert_close(result['real_token_mask'], real_token_mask)
         else:
             # The sequence is split into 2*cp_size equal chunks. This rank
             # gets chunk cp_rank and chunk 2*cp_size - cp_rank - 1.
@@ -677,6 +790,8 @@ def test_get_batch_on_this_cp_rank_per_sequence_balancing(cp_size, seq_length):
             assert torch.equal(
                 result['tokens'], expected
             ), f"cp_rank={cp_rank}: expected {expected}, got {result['tokens']}"
+            expected_real_token_mask = expected.remainder(3) != 0
+            torch.testing.assert_close(result['real_token_mask'], expected_real_token_mask)
 
         # cu_seqlens and max_seqlen must be unchanged.
         assert torch.equal(result['cu_seqlens'], cu_seqlens)

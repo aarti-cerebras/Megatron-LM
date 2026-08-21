@@ -36,9 +36,7 @@ class SFTLowLevelDataset:
         try:
             from datasets import load_dataset
         except ImportError:
-            raise ImportError(
-                "SFTDataset currently requires datasets library to be installed"
-            )
+            raise ImportError("SFTDataset currently requires datasets library to be installed")
         self.dataset = load_dataset("json", data_files=dataset_path, split="all")
 
     def __len__(self) -> int:
@@ -83,7 +81,7 @@ class SFTDataset(MegatronDataset):
                     split_conversations.append(current)
                 current = [msg]  # Then start the new conversation
             else:
-                current.append(msg) # Continue accumulating the current conversation
+                current.append(msg)  # Continue accumulating the current conversation
         if current:  # Store any remaining conversation
             split_conversations.append(current)
         return split_conversations
@@ -96,14 +94,16 @@ class SFTDataset(MegatronDataset):
         merged_conversations = self.dataset[int(self.indices[idx % len(self.indices)])]
         split_conversations = self._split_conversations(merged_conversations)
 
-        def extend_with_padding(tokens, targets, positions, pad_len):
+        def extend_with_padding(tokens, targets, positions, real_token_mask, pad_len):
             tokens.extend([pad] * pad_len)
             targets.extend([pad] * pad_len)
-            positions.extend(range(positions[-1]+1, positions[-1]+1+pad_len))
+            positions.extend(range(positions[-1] + 1, positions[-1] + 1 + pad_len))
+            real_token_mask.extend([False] * pad_len)
 
         pack_tokens = []
         pack_targets = []
         pack_positions = []
+        pack_real_token_mask = []
         cu_seqlens = [0]
         eod = tokenizer.eod
         pad = tokenizer.pad
@@ -117,9 +117,9 @@ class SFTDataset(MegatronDataset):
             tokens_list = tokens.tolist()
             targets_list = targets.tolist()
 
-
             pack_tokens.extend(tokens_list)
             pack_targets.extend(targets_list)
+            pack_real_token_mask.extend([True] * len(tokens_list))
 
             assert not self.config.reset_position_ids
             pack_positions.extend(range(len(tokens_list)))
@@ -129,7 +129,9 @@ class SFTDataset(MegatronDataset):
                 mod_token_count = len(pack_tokens) % pad_granularity
                 if mod_token_count != 0:
                     pad_len = pad_granularity - mod_token_count
-                    extend_with_padding(pack_tokens, pack_targets, pack_positions, pad_len)
+                    extend_with_padding(
+                        pack_tokens, pack_targets, pack_positions, pack_real_token_mask, pad_len
+                    )
 
             # TODO(duncan): Consider also padding to multiple of number of tokens here. This might
             # be needed for efficiency (and potentially set via command-line argument).
@@ -142,9 +144,11 @@ class SFTDataset(MegatronDataset):
                 max_body = pack_length
                 pack_tokens = pack_tokens[:max_body]
                 pack_targets = pack_targets[:max_body]
+                pack_real_token_mask = pack_real_token_mask[:max_body]
                 pack_tokens.append(pad)
                 pack_targets.append(pad)
-                pack_positions = pack_positions[:pack_length+1]
+                pack_real_token_mask.append(False)
+                pack_positions = pack_positions[: pack_length + 1]
                 # Note len({pack_tokens, pack_targets, pack_positions}) should be pack_length + 1
                 cu_seqlens[-1] = len(pack_tokens) - 1
                 break
@@ -152,23 +156,29 @@ class SFTDataset(MegatronDataset):
         # Handle any necessary padding
         if len(pack_tokens) < pack_length + 1:  # +1 here to account for later alignment
             pad_len = pack_length + 1 - len(pack_tokens)
-            extend_with_padding(pack_tokens, pack_targets, pack_positions, pad_len)
+            extend_with_padding(
+                pack_tokens, pack_targets, pack_positions, pack_real_token_mask, pad_len
+            )
             # Note len({pack_tokens, pack_targets, pack_positions}) should be pack_length + 1
             cu_seqlens[-1] = len(pack_tokens) - 1
 
         assert len(pack_tokens) == pack_length + 1
         assert len(pack_targets) == pack_length + 1
         assert len(pack_positions) == pack_length + 1
+        assert len(pack_real_token_mask) == pack_length + 1
 
         # Align and convert to tensors
-        input_ids    = torch.tensor(pack_tokens[:-1],  dtype=torch.int64)
-        labels       = torch.tensor(pack_targets[1:], dtype=torch.int64)
+        input_ids = torch.tensor(pack_tokens[:-1], dtype=torch.int64)
+        labels = torch.tensor(pack_targets[1:], dtype=torch.int64)
         position_ids = torch.tensor(pack_positions[:-1], dtype=torch.int64)
+        real_token_mask = torch.tensor(pack_real_token_mask[:-1], dtype=torch.bool)
+        target_real_token_mask = torch.tensor(pack_real_token_mask[1:], dtype=torch.bool)
 
         # Loss mask.
-        loss_mask = torch.ones(pack_length, dtype=torch.float32)
-        loss_mask[labels == pad] = 0.0  # Mask paddings
-        loss_mask[labels == IGNORE_INDEX] = 0.0  # mask prompts
+        # Tokenizers may reuse a real end-of-text token as padding, so token IDs cannot
+        # distinguish genuine assistant targets from synthetic tail padding. Use the shifted
+        # provenance mask for target validity and the tokenizer target mask for supervision.
+        loss_mask = (target_real_token_mask & (labels != IGNORE_INDEX)).float()
 
         # TODO(duncan): Optionally create an attention mask
         assert not self.config.create_attention_mask and not self.config.reset_attention_mask
@@ -185,10 +195,8 @@ class SFTDataset(MegatronDataset):
         # stack samples with different numbers of documents.  Trailing
         # entries are filled with pack_length; the merge helper strips
         # them later.
-        padded_cu_seqlens = torch.full(
-            (pack_length + 1,), pack_length, dtype=torch.int32,
-        )
-        padded_cu_seqlens[:cu_seqlens.numel()] = cu_seqlens
+        padded_cu_seqlens = torch.full((pack_length + 1,), pack_length, dtype=torch.int32)
+        padded_cu_seqlens[: cu_seqlens.numel()] = cu_seqlens
 
         return {
             'tokens': input_ids,
@@ -196,6 +204,7 @@ class SFTDataset(MegatronDataset):
             # 'attention_mask': attention_mask,  # PyTorch collate cannot handle NoneType
             'loss_mask': loss_mask,
             'position_ids': position_ids,
+            'real_token_mask': real_token_mask,
             'cu_seqlens': padded_cu_seqlens,
             'max_seqlen': max_seqlen,
         }

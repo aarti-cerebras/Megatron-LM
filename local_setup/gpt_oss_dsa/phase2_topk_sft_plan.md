@@ -1,6 +1,7 @@
 # GPT-OSS DSA Phase 2 Top-K SFT Training Plan
 
-**Status:** Implementation in progress; Workstream A complete
+**Status:** Implementation in progress; Workstreams A and B implemented, focused Workstream B GPU
+and native-tokenizer validation complete
 
 **Baseline:** `aarti/gpt-oss-dsa` at `26d2e475e`
 
@@ -100,8 +101,12 @@ Phase 1 already provides:
 - separate base/indexer learning-rate groups and gradient diagnostics;
 - per-layer KL, token recall, and decomposed attention-mass quality metrics.
 
-Workstream A resolves the sparse-attention correctness blockers described below. The remaining SFT
-masking, loss normalization, checkpoint-transition, and performance gaps still block a full Phase 2
+Workstream A resolves the sparse-attention correctness blockers described below. Workstream B now
+implements provenance-based SFT masking, CP-global DSA normalization, GPT-OSS assistant targets,
+and the required batch plumbing. Its full focused suite passes under the repository container on
+8 H100s with the native GPT-OSS tokenizer. Stronger live unequal-row, gradient-accumulation,
+prompt-gradient, distributed-optimizer, and Megatron-FSDP integration coverage remains pending.
+Checkpoint transition, diagnostics, recipes, and performance gaps still block a full Phase 2
 training run.
 
 ### 4.1 Sparse attention rejects true GQA (resolved)
@@ -116,25 +121,31 @@ GPT-OSS dense attention uses a learned per-query-head `softmax_offset`. The spar
 its online softmax with that sink exactly once, includes it in the denominator with a zero value
 vector, and propagates gradients to the dense delegate's sink parameter.
 
-### 4.3 SFT padding is not excluded from indexer KL
+### 4.3 SFT padding is not excluded from indexer KL (implemented; focused validation complete)
 
-The DSA masking code can read `packed_seq_params.real_token_mask_q`, but `PackedSeqParams` has no
-such field and the SFT dataset does not construct or pass a real-token mask. Tail padding can
-therefore contribute nonzero KL rows and inflate the denominator.
+`SFTDataset` now records token provenance independently of token IDs, the batch path threads it
+through TP/PP/CP and packed microbatches, and `PackedSeqParams.real_token_mask_q` excludes synthetic
+padding rows from DSA KL. CPU-level provenance and padding-invariance coverage passes as part of the
+8-GPU distributed suite; an end-to-end GPU indexer padding-invariance assertion remains pending.
 
-### 4.4 SFT and DSA need separate denominators
+### 4.4 SFT and DSA need separate denominators (implemented; focused validation complete)
 
-The SFT language-model count contains supervised assistant tokens. The DSA count must contain all
-real prompt and assistant query rows. Reusing the language-model denominator makes the effective
-indexer coefficient depend on the prompt/response ratio. With context parallelism, averaging local
-means is also incorrect when CP ranks own different real-row counts.
+The DSA loss now uses a CP-global real-query count independently of the SFT language-model count.
+Its logging path sums the CP-local normalized numerators rather than averaging local means. Unit
+coverage exercises unequal CP row counts and different gradient-accumulation microbatch counts.
+The batch plumbing passes with PP/CP and microbatch size greater than one on 8 GPUs; live unequal
+row counts across CP ranks and actual gradient-accumulation microbatches remain pending.
 
-### 4.5 GPT-OSS assistant-only masking needs an explicit contract
+### 4.5 GPT-OSS assistant-only masking needs an explicit contract (implemented; native validation complete)
 
-The generic `SFTTokenizer` `default` format uses the Hugging Face chat template but currently
-supervises every rendered token. The Nemotron-specific formats perform role masking but are not the
-GPT-OSS chat format. Phase 2 must verify or implement GPT-OSS assistant-target masking rather than
-silently training on prompts.
+The dedicated `gpt-oss` prompt format uses the native Hugging Face chat template and parses Harmony
+message boundaries to supervise assistant analysis/final/tool-call payloads and their terminators
+while masking system, developer, user, and tool messages. LM padding validity uses shifted token
+provenance, so a real assistant terminator remains supervised even when its ID is also used for
+padding. Parser tests use a faithful synthetic Harmony stream, and native validation passes with
+the installed GPT-OSS tokenizer for developer/user/tool masking and assistant analysis, final, and
+tool-call targets. Explicit native system-message and additional malformed-stream edge cases remain
+pending.
 
 ### 4.6 The correctness backend is not yet a long-context performance backend
 

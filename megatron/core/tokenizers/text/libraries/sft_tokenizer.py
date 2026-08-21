@@ -91,7 +91,7 @@ class SFTTokenizer:
                 has_bos=False,
                 has_system_role=True,
             )
-        elif prompt_format == "default":
+        elif prompt_format in ("default", "gpt-oss"):
             self._prompt_config = PromptConfig(
                 assistant_prefix_len=0,
                 pad_token_id=(
@@ -107,6 +107,82 @@ class SFTTokenizer:
             raise NotImplementedError("unknown SFT prompt format", prompt_format)
 
         self._prompt_format = prompt_format
+
+    def _mask_gpt_oss_assistant_targets(self, tokens: np.ndarray) -> np.ndarray:
+        """Keep GPT-OSS assistant payloads and mask every other rendered token.
+
+        The native GPT-OSS Harmony chat template does not contain Hugging Face
+        ``generation`` blocks, so ``return_assistant_tokens_mask`` returns an
+        all-zero mask. Harmony messages have an explicit token protocol:
+        ``<|start|>ROLE ... <|message|>PAYLOAD<TERMINATOR>``. Supervise the
+        payload and terminator for every assistant block while leaving the role
+        and channel prefix masked.
+        """
+        special_token_ids = {
+            name: self._tokenizer.convert_tokens_to_ids(token)
+            for name, token in (
+                ("start", "<|start|>"),
+                ("message", "<|message|>"),
+                ("end", "<|end|>"),
+                ("return", "<|return|>"),
+                ("call", "<|call|>"),
+            )
+        }
+        if any(token_id is None or token_id < 0 for token_id in special_token_ids.values()):
+            raise ValueError("The gpt-oss SFT format requires Harmony special tokens.")
+        if len(set(special_token_ids.values())) != len(special_token_ids):
+            raise ValueError("The gpt-oss SFT format requires distinct Harmony special-token IDs.")
+
+        assistant_ids = self._tokenizer.encode("assistant", add_special_tokens=False)
+        if not assistant_ids:
+            raise ValueError("The gpt-oss tokenizer could not encode the assistant role.")
+
+        target = np.full_like(tokens, IGNORE_INDEX)
+        assistant_block_count = 0
+        token_count = len(tokens)
+        index = 0
+        terminators = {
+            special_token_ids["end"],
+            special_token_ids["return"],
+            special_token_ids["call"],
+        }
+        while index < token_count:
+            if tokens[index] != special_token_ids["start"]:
+                index += 1
+                continue
+
+            header_start = index + 1
+            message_index = header_start
+            while message_index < token_count and tokens[message_index] not in (
+                special_token_ids["message"],
+                special_token_ids["start"],
+            ):
+                message_index += 1
+            if (
+                message_index >= token_count
+                or tokens[message_index] != special_token_ids["message"]
+            ):
+                index = message_index
+                continue
+
+            is_assistant = tokens[
+                header_start : header_start + len(assistant_ids)
+            ].tolist() == list(assistant_ids)
+            block_end = message_index + 1
+            while block_end < token_count and tokens[block_end] not in terminators:
+                block_end += 1
+            if block_end >= token_count:
+                raise ValueError("GPT-OSS Harmony message is missing its terminator token.")
+            if is_assistant:
+                target[message_index + 1 : block_end + 1] = tokens[
+                    message_index + 1 : block_end + 1
+                ]
+                assistant_block_count += 1
+            index = block_end + 1
+
+        if assistant_block_count == 0:
+            raise ValueError("GPT-OSS SFT conversation contains no rendered assistant blocks.")
+        return target
 
     @staticmethod
     def _extract_token_ids(result) -> np.ndarray:
@@ -140,7 +216,8 @@ class SFTTokenizer:
                     {"role": "user", "content": "something1"},
                     {"role": "assistant", "content": "something2"},
                 ]
-            return_target (bool): Return target tokens with system and assistant masked.
+            return_target (bool): Return target tokens with non-assistant content masked when the
+                selected prompt format supports assistant-only supervision.
             add_generation_prompt (bool): Add assistant prefix to the end.
         """
         # Skip system message if the tokenizer doesn't have a system role.
@@ -152,7 +229,6 @@ class SFTTokenizer:
                 conversation,
                 tokenize=True,
                 add_generation_prompt=add_generation_prompt,
-                return_assistant_token_mask=False,
                 return_tensors="np",
                 chat_template=self._prompt_config.custom_chat_template,
             )
@@ -162,6 +238,9 @@ class SFTTokenizer:
             return tokens
 
         target = tokens.copy()
+
+        if self._prompt_format == "gpt-oss":
+            return tokens, self._mask_gpt_oss_assistant_targets(tokens)
 
         # When using the default prompt format, we do not replace any tokens with IGNORE_INDEX.
         # Instead, all token losses will be used for simplicity.

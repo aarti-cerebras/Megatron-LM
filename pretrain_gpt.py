@@ -103,6 +103,7 @@ BATCH_KEYS = [
     "loss_mask",
     "max_seqlen",
     "position_ids",
+    "real_token_mask",
     "tokens",
 ]
 
@@ -148,6 +149,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
         broadcast_group=mpu.get_tensor_model_parallel_group(),
         has_cu_seqlens=has_cu_seqlens,
+        has_real_token_mask=is_sft,
         is_hybrid_cp=is_hybrid_cp,
         create_attention_mask_in_dataloader=create_attention_mask_in_dataloader,
         cp_size=cp_size,
@@ -162,6 +164,14 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
 
     batch = flatten_batch_for_packed_sequences(batch)
 
+    batch = get_batch_on_this_cp_rank(
+        batch,
+        is_hybrid_cp=is_hybrid_cp,
+        cp_group=get_context_parallel_group(),
+        hybrid_cp_group_func=get_hybrid_data_context_parallel_groups,
+        use_per_sequence_balancing=args.dataloader_inter_document_masking and not is_sft,
+    )
+
     if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
         assert has_cu_seqlens
         return (
@@ -174,16 +184,9 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             None,
             batch['max_seqlen'],
             None,
+            batch['real_token_mask'],
             None,
         )
-
-    batch = get_batch_on_this_cp_rank(
-        batch,
-        is_hybrid_cp=is_hybrid_cp,
-        cp_group=get_context_parallel_group(),
-        hybrid_cp_group_func=get_hybrid_data_context_parallel_groups,
-        use_per_sequence_balancing=args.dataloader_inter_document_masking and not is_sft,
-    )
 
     # Return values in BATCH_KEYS order so callers can unpack into the fixed
     # names regardless of any provenance fields wrappers like BlendedDataset
@@ -328,6 +331,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
             loss_mask,
             max_seqlen,
             position_ids,
+            real_token_mask,
             tokens,
         ) = get_batch(data_iterator, vp_stage)
 
@@ -355,6 +359,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
             local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
             cp_group=hybrid_cp_group,
             tokens_per_sample=args.seq_length,
+            real_token_mask_q=real_token_mask,
         )
 
     timers('batch-generator').stop()
@@ -374,6 +379,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 attention_mask,
                 labels=labels,
                 loss_mask=loss_mask,
+                packed_seq_params=packed_seq_params,
                 output_processor=output_processor,
             )
             return schedule_plan, partial(loss_func, loss_mask, model=model)

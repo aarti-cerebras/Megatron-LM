@@ -727,6 +727,7 @@ def compute_dsa_indexer_loss(
         loss_coeff,
         query_valid_rows=query_valid_rows,
         calculate_per_token_loss=calculate_per_token_loss,
+        normalization_group=getattr(pg_collection, "cp", None),
     )
 
 
@@ -1001,7 +1002,12 @@ def bwd_fused_indexer_loss_naive(
             else torch.tensor(
                 float(b * sq), dtype=torch.float32, device=attention_scores_normalized.device
             )
-        ).clamp_min(1.0)
+        )
+        normalization_group = getattr(pg_collection, "cp", None)
+        if normalization_group is not None:
+            valid_row_count = valid_row_count.detach().clone()
+            torch.distributed.all_reduce(valid_row_count, group=normalization_group)
+        valid_row_count = valid_row_count.clamp_min(1.0)
         grad_kl_per_row = grad_kl_div / valid_row_count  # scalar value for each real row
 
     # Backward through sum(dim=-1): broadcast back to [b, sq, sk]
@@ -1459,6 +1465,7 @@ def fwd_blockwise_indexer_loss(
         num_rows=b * sq,
         calculate_per_token_loss=calculate_per_token_loss,
         valid_row_count=valid_row_count,
+        normalization_group=getattr(pg_collection, "cp", None),
     )
     if metrics_out is not None:
         metrics_out.update(
@@ -1523,7 +1530,12 @@ def bwd_blockwise_indexer_loss(
             query_valid_rows.sum().float()
             if query_valid_rows is not None
             else torch.tensor(float(b * sq), dtype=torch.float32, device=q.device)
-        ).clamp_min(1.0)
+        )
+        normalization_group = getattr(pg_collection, "cp", None)
+        if normalization_group is not None:
+            valid_row_count = valid_row_count.detach().clone()
+            torch.distributed.all_reduce(valid_row_count, group=normalization_group)
+        valid_row_count = valid_row_count.clamp_min(1.0)
         row_scale = grad_loss.float() * loss_coeff / valid_row_count
 
     grad_q = torch.zeros_like(q, dtype=torch.float32)
@@ -2796,12 +2808,12 @@ class DSAttention(MegatronModule):
             and varlen_ends is not None
             and key_positions is None
         )
-        indexer_reduce_group = (
-            cp_group if cp_size > 1 and self.config.calculate_per_token_loss else None
-        )
-        indexer_avg_group = (
-            cp_group if cp_size > 1 and not self.config.calculate_per_token_loss else None
-        )
+        # Per-token mode reports a raw local sum. Mean mode divides each local KL sum by the
+        # CP-global real-row count. Summing either quantity across CP produces the intended
+        # global statistic; averaging the already globally normalized mean would divide by CP
+        # a second time.
+        indexer_reduce_group = cp_group if cp_size > 1 else None
+        indexer_avg_group = None
 
         topk_holder = (
             self._get_index_share_topk_holder(packed_seq_params, attention_mask)
