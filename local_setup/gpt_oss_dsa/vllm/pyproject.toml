@@ -1,0 +1,27 @@
+[project]
+name = "gpt-oss-dsa-vllm"
+version = "0"
+description = "vLLM serving plugin for GPT-OSS with Megatron-trained DeepSeek Sparse Attention indexers."
+# vLLM 0.26.0 is the release Aarti's Qwen3 DSA plugin was verified against; it is the first with the
+# sparse indexer kernels, the CUSTOM attention backend slot and the subclassable GptOss model.
+requires-python = "==3.12.*"
+dependencies = [
+    "vllm==0.26.0",
+    # A runtime dependency, not a build one: FlashInfer JIT-compiles its sampling kernel during
+    # bringup and shells out to `ninja` by name. serve.sh puts this venv's bin on PATH for it.
+    "ninja",
+]
+
+# fast-hadamard-transform is deliberately not listed: it is a CUDA extension built against the
+# venv's torch, which uv cannot resolve on a host without a CUDA toolchain. README.md has the
+# install step; gpt_oss_dsa/indexer.py refuses to serve without it unless overridden.
+
+[project.entry-points."vllm.general_plugins"]
+gpt_oss_dsa = "gpt_oss_dsa:register"
+
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["gpt_oss_dsa"]
